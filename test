@@ -1,0 +1,47 @@
+#!/bin/bash
+# Usage: bash soak-status.sh ["start time UTC"]   default: start of the current soak run
+export AWS_PROFILE=hob-mfa-nonprod AWS_REGION=eu-west-2
+START=${1:-"2026-10-19 13:40"}; NOW=$(date -u '+%Y-%m-%d %H:%M')
+LG=/dna/prp02/dna-email
+PARSE='parse @message /Handling success for message id \[<\d+\.\d+\.(?<sent>\d{13})\.JavaMail/ | filter ispresent(sent)'
+
+run() {
+  QID=$(aws logs start-query --log-group-name $LG --start-time $(date -u -d "$1" +%s) \
+        --end-time $(date -u -d "$2" +%s) --query-string "$3" --query queryId --output text)
+  while :; do ST=$(aws logs get-query-results --query-id $QID --query status --output text)
+    [ "$ST" = Complete ] && break; [ "$ST" = Failed ] && { echo "query failed"; return; }; sleep 3; done
+  aws logs get-query-results --query-id $QID --query 'results[*][*].value' --output text
+}
+
+echo "=== dna-email tasks"
+TASKS=$(aws ecs list-tasks --cluster ecs-dna-core-prp02 --service-name dna-email-prp02 --query taskArns --output text)
+aws ecs describe-tasks --cluster ecs-dna-core-prp02 --tasks $TASKS \
+  --query 'tasks[].[taskArn,lastStatus,startedAt]' --output text \
+  | awk '{n=split($1,a,"/"); printf "  %s  %s  started %s\n", substr(a[n],1,8), $2, substr($3,1,16)}'
+
+echo; echo "=== Latest processed email"
+LAST=$(run "$(date -u -d '-2 hours' '+%Y-%m-%d %H:%M')" "$NOW" \
+  "$PARSE | fields @timestamp, sent | sort @timestamp desc | limit 1")
+if [ -z "$LAST" ]; then
+  echo "  NONE in the last 2 hours  <-- PROCESSING HAS STOPPED"
+else
+  TS=$(echo "$LAST" | cut -f1); SENT=$(echo "$LAST" | cut -f2)
+  TSE=$(date -u -d "${TS%.*} UTC" +%s); AGO=$(( ($(date -u +%s) - TSE) / 60 ))
+  LAG=$(( (TSE*1000 - SENT) / 60000 ))
+  echo "  processed at:  ${TS%.*} UTC  ($AGO min ago)"
+  echo "  that email was sent $((LAG/60))h $((LAG%60))m earlier"
+  [ $AGO -ge 15 ] && echo "  WARNING: nothing processed for $AGO minutes - it may have stopped"
+fi
+
+echo; echo "=== Processed per hour since $START UTC"
+printf "  %-12s %9s %9s\n" "hour" "processed" "lag(h)"
+run "$START" "$NOW" \
+  "$PARSE | stats count(*) as n, avg((toMillis(@timestamp) - sent) / 3600000) as lag by bin(1h) as hour | sort hour asc" \
+| awk -F'\t' '{printf "  %-12s %9d %9.1f\n", substr($1,6,11), $2, $3; t+=$2}
+              END {printf "  %-12s %9d\n", "TOTAL", t}'
+
+echo; echo "=== Errors in the last 6 hours"
+run "$(date -u -d '-6 hours' '+%Y-%m-%d %H:%M')" "$NOW" \
+  'fields @timestamp, @message | filter @message like /\sERROR\s/ | sort @timestamp desc | limit 10' \
+| awk -F'\t' '{print "  " substr($1,6,14) "  " substr($2,1,150)}'
+echo "  (blank = no errors)"

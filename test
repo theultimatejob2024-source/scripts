@@ -1,1 +1,205 @@
-Write a bash script using AWS CLI (region eu-west-2) and jq that: 1) lists all CloudWatch log groups whose names start with /dna/dtp02, handling pagination; 2) for each log group, runs a CloudWatch Logs Insights query over the last 3 days that filters @message with the case-insensitive regex (passw|pwd|j_password|secret|token|authorization|bindpassword|userpassword) and returns @timestamp and @message (limit 50 per log group); 3) polls each query until it is Complete, Failed or Cancelled, and handles throttling with retries; 4) replaces any value following =, : or a space after the matched keyword with **** before saving, so no real passwords are written out; 5) writes a CSV report with columns: log group, match count, timestamp, masked message; 6) prints a summary of log groups with matches and their counts. Skip log groups with no matches, log any errors without stopping the script, and use set -uo pipefail.
+#!/usr/bin/env bash
+#
+# find-cloudwatch-log-groups.sh
+#
+# Reads a list of IPs (one per line), SSHes to each one with a password,
+# then uses sudo to run READ-ONLY checks that discover which CloudWatch
+# log groups the instance is configured to write to.
+#
+# Sources checked on each instance:
+#   - Unified CloudWatch agent (amazon-cloudwatch-agent) config
+#   - Legacy awslogs agent config
+#   - Fluent Bit / Fluentd configs (cloudwatch / cloudwatch_logs outputs)
+#   - Docker containers using the "awslogs" log driver (+ daemon.json default)
+#
+# Usage:  ./find-cloudwatch-log-groups.sh
+#         (you'll be prompted for the SSH password, then the sudo password if required)
+
+# ===================== PARAMETERS – EDIT THESE =====================
+IP_FILE="ips.txt"                          # file with one IP per line
+SSH_USER="ec2-user"                        # SSH username
+RESULTS_FILE="cloudwatch_log_groups.csv"   # CSV output (ip,log_group,source)
+SSH_CONNECT_TIMEOUT=10                     # seconds
+SSH_OPTS=(
+  -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}"
+  -o StrictHostKeyChecking=accept-new
+  -o PreferredAuthentications=keyboard-interactive,password
+  -o PubkeyAuthentication=no
+)
+# ===================================================================
+
+if [[ ! -f "$IP_FILE" ]]; then
+  echo "ERROR: IP file not found: $IP_FILE" >&2
+  exit 1
+fi
+
+# ------------------------------------------------------------------
+# Script that runs ON the remote host as root. It only reads files and
+# queries service/container status – it changes nothing.
+# Output lines:  FOUND<TAB>log_group<TAB>source   |   INFO<TAB>message
+# ------------------------------------------------------------------
+REMOTE_SCRIPT=$(cat <<'REMOTE_EOF'
+TAB=$'\t'
+found=0
+emit() { printf 'FOUND%s%s%s%s\n' "$TAB" "$1" "$TAB" "$2"; found=1; }
+info() { printf 'INFO%s%s\n' "$TAB" "$*"; }
+svc_state() { local s; s=$(systemctl is-active "$1" 2>/dev/null); echo "${s:-unknown}"; }
+
+# --- Resolve placeholders like {instance_id} via instance metadata (read-only) ---
+MD_LOADED=0; IID=""; LHOST=""; LIP=""
+load_md() {
+  [ "$MD_LOADED" = 1 ] && return
+  MD_LOADED=1
+  command -v curl >/dev/null 2>&1 || return
+  local tok hdr=()
+  tok=$(curl -s -m 2 -X PUT "http://169.254.169.254/latest/api/token" \
+        -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null)
+  [ -n "$tok" ] && hdr=(-H "X-aws-ec2-metadata-token: $tok")
+  IID=$(curl -s -m 2 "${hdr[@]}" http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null)
+  LHOST=$(curl -s -m 2 "${hdr[@]}" http://169.254.169.254/latest/meta-data/local-hostname 2>/dev/null)
+  LIP=$(curl -s -m 2 "${hdr[@]}" http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null)
+}
+resolve() {   # sets RESOLVED
+  local g="$1"
+  if [[ "$g" == *"{"* ]]; then
+    load_md
+    [ -n "$IID" ]   && g=${g//\{instance_id\}/$IID}
+    [ -n "$LHOST" ] && g=${g//\{local_hostname\}/$LHOST}
+    [ -n "$LIP" ]   && g=${g//\{ip_address\}/$LIP}
+    g=${g//\{hostname\}/$(hostname)}
+  fi
+  RESOLVED="$g"
+}
+
+# --- 1. Unified CloudWatch agent ---
+CWA=/opt/aws/amazon-cloudwatch-agent
+if [ -d "$CWA" ]; then
+  info "CloudWatch agent installed (service: $(svc_state amazon-cloudwatch-agent))"
+  CWA_LOGS=$(ls "$CWA"/logs/amazon-cloudwatch-agent.log* 2>/dev/null)
+  cwa_files=()
+  # The .toml is the config the agent is actually running; fall back to JSON sources.
+  if [ -f "$CWA/etc/amazon-cloudwatch-agent.toml" ]; then
+    cwa_files=("$CWA/etc/amazon-cloudwatch-agent.toml")
+  else
+    for f in "$CWA/etc/amazon-cloudwatch-agent.json" "$CWA"/etc/amazon-cloudwatch-agent.d/*; do
+      [ -f "$f" ] && cwa_files+=("$f")
+    done
+  fi
+  for f in "${cwa_files[@]}"; do
+    while IFS= read -r g; do
+      [ -z "$g" ] && continue
+      resolve "$g"; g="$RESOLVED"
+      note=""
+      if [ -n "$CWA_LOGS" ] && grep -qF "piping log from ${g}/" $CWA_LOGS 2>/dev/null; then
+        note=" [seen in agent log]"
+      fi
+      emit "$g" "cloudwatch-agent: $f$note"
+    done < <(grep -oE '"?log_group_name"?[[:space:]]*[:=][[:space:]]*"[^"]+"' "$f" 2>/dev/null \
+             | sed -E 's/.*[:=][[:space:]]*"([^"]+)"$/\1/')
+  done
+fi
+
+# --- 2. Legacy awslogs agent ---
+for f in /etc/awslogs/awslogs.conf /etc/awslogs/config/* /var/awslogs/etc/awslogs.conf /var/awslogs/etc/config/*; do
+  [ -f "$f" ] || continue
+  info "Legacy awslogs config found: $f (awslogsd: $(svc_state awslogsd), awslogs: $(svc_state awslogs))"
+  while IFS= read -r g; do
+    [ -z "$g" ] && continue
+    resolve "$g"; emit "$RESOLVED" "awslogs (legacy agent): $f"
+  done < <(sed -nE 's/^[[:space:]]*log_group_name[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1/p' "$f" 2>/dev/null)
+done
+
+# --- 3. Fluent Bit / Fluentd ---
+for d in /etc/fluent-bit /etc/td-agent-bit /opt/fluent-bit/etc /etc/fluent /etc/fluentd /etc/td-agent; do
+  [ -d "$d" ] || continue
+  while IFS= read -r line; do
+    f=${line%%:*}; v=${line#*:}
+    g=$(printf '%s' "$v" | sed -E 's/^[[:space:]]*log_group_name[[:space:]]*[:=]?[[:space:]]*//; s/[[:space:]]+$//; s/^"(.*)"$/\1/')
+    [ -z "$g" ] && continue
+    resolve "$g"; emit "$RESOLVED" "fluent: $f"
+  done < <(grep -rHE '^[[:space:]]*log_group_name([[:space:]]|:|=)' "$d" 2>/dev/null)
+done
+
+# --- 4. Docker awslogs log driver ---
+if command -v docker >/dev/null 2>&1; then
+  if [ -f /etc/docker/daemon.json ]; then
+    while IFS= read -r g; do
+      [ -n "$g" ] && emit "$g" "docker daemon default: /etc/docker/daemon.json"
+    done < <(grep -oE '"awslogs-group"[[:space:]]*:[[:space:]]*"[^"]+"' /etc/docker/daemon.json 2>/dev/null \
+             | sed -E 's/.*"([^"]+)"$/\1/')
+  fi
+  while read -r name type group; do
+    [ "$type" = "awslogs" ] || continue
+    [ -n "$group" ] && [ "$group" != "<no value>" ] && emit "$group" "docker container: ${name#/}"
+  done < <(docker ps -q 2>/dev/null | xargs -r docker inspect \
+           -f '{{.Name}} {{.HostConfig.LogConfig.Type}} {{index .HostConfig.LogConfig.Config "awslogs-group"}}' 2>/dev/null)
+fi
+
+[ "$found" = 0 ] && info "No CloudWatch log group configuration found on this host."
+exit 0
+REMOTE_EOF
+)
+
+# Encode so it survives SSH quoting intact
+B64=$(printf '%s\n' "$REMOTE_SCRIPT" | base64 | tr -d '\n')
+REMOTE_CMD="sudo -p '[sudo] password for %u on %H: ' bash -c \"\$(echo ${B64} | base64 -d)\""
+
+csvq() { local s=${1//\"/\"\"}; printf '"%s"' "$s"; }
+
+TMP_OUT=$(mktemp)
+ALL_GROUPS=$(mktemp)
+trap 'rm -f "$TMP_OUT" "$ALL_GROUPS"' EXIT
+
+echo "ip,log_group,source" > "$RESULTS_FILE"
+FAILED=()
+
+# Read IPs on fd 3 so SSH keeps the terminal for password prompts
+while IFS= read -r ip <&3 || [[ -n "$ip" ]]; do
+  ip="${ip%%#*}"                       # drop comments
+  ip=$(printf '%s' "$ip" | tr -d '[:space:]')   # drop whitespace / CR
+  [[ -z "$ip" ]] && continue
+
+  echo
+  echo "================ ${SSH_USER}@${ip} ================"
+
+  ssh -t "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" "$REMOTE_CMD" | tee "$TMP_OUT"
+  rc=${PIPESTATUS[0]}
+
+  if (( rc == 255 )); then
+    echo ">> SSH connection/authentication failed for $ip"
+    FAILED+=("$ip (ssh failed)")
+    continue
+  elif (( rc != 0 )); then
+    echo ">> Remote command failed for $ip (exit $rc) – sudo may have been denied"
+    FAILED+=("$ip (remote exit $rc)")
+    continue
+  fi
+
+  echo "---- Log groups for $ip ----"
+  count=0
+  while IFS=$'\t' read -r group source; do
+    [[ -z "$group" ]] && continue
+    printf '  %-50s  (%s)\n' "$group" "$source"
+    echo "$(csvq "$ip"),$(csvq "$group"),$(csvq "$source")" >> "$RESULTS_FILE"
+    echo "$group" >> "$ALL_GROUPS"
+    count=$((count + 1))
+  done < <(tr -d '\r' < "$TMP_OUT" | awk -F'\t' '$1=="FOUND"{print $2"\t"$3}' | sort -u)
+  (( count == 0 )) && echo "  (none found)"
+
+done 3< "$IP_FILE"
+
+echo
+echo "================ SUMMARY ================"
+echo "Unique log groups across all hosts:"
+if [[ -s "$ALL_GROUPS" ]]; then
+  sort -u "$ALL_GROUPS" | sed 's/^/  /'
+else
+  echo "  (none)"
+fi
+if (( ${#FAILED[@]} > 0 )); then
+  echo
+  echo "Hosts that failed:"
+  printf '  %s\n' "${FAILED[@]}"
+fi
+echo
+echo "Full results written to: $RESULTS_FILE"

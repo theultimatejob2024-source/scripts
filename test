@@ -1,8 +1,26 @@
-for g in "instance-logs" "/dna/instance-logs"; do
-  echo "=== $g ==="
-  aws logs describe-log-streams \
-    --log-group-name "$g" \
-    --order-by LastEventTime --descending \
-    --query 'logStreams[].logStreamName' \
-    --output text | tr '\t' '\n'
-done
+#!/usr/bin/env bash
+ID_FILE="instance-ids.txt"
+LOG_GROUPS=("instance-logs" "/dna/instance-logs")
+
+export AWS_RETRY_MODE=adaptive   # backs off automatically when throttled
+export AWS_MAX_ATTEMPTS=10
+
+while IFS= read -r id || [[ -n "$id" ]]; do
+  id=$(printf '%s' "$id" | tr -d '[:space:]')
+  [[ -z "$id" ]] && continue
+  for g in "${LOG_GROUPS[@]}"; do
+    streams=$(aws logs describe-log-streams \
+      --log-group-name "$g" \
+      --log-stream-name-prefix "standalone/$id/" \
+      --query 'logStreams[].logStreamName' \
+      --output text 2>&1)
+    if [[ $? -ne 0 ]]; then
+      echo "ERROR  $id  $g  $streams"
+    elif [[ -z "$streams" || "$streams" == "None" ]]; then
+      echo "NONE   $id  $g"
+    else
+      printf '%s\n' $streams | sed "s|^|FOUND  $id  $g  |"
+    fi
+  done
+  sleep 0.2   # stay under the API rate limit
+done < "$ID_FILE"

@@ -1,175 +1,26 @@
-#!/usr/bin/env bash
-#
-# scan-logs-for-credentials.sh
-#
-# For each instance ID in a file, pull that instance's CloudWatch log events
-# (last N days) and grep them for credential-looking patterns relevant to
-# infra services (mail, proxy, web, DNS, SNMP, TLS, generic passwords).
-#
-# Only the log streams whose prefix matches the instance ID are fetched, so a
-# log group with thousands of unrelated streams is NOT scanned in full.
-#
-# Pure Bash: needs only the aws CLI, grep, sed and awk. No Python, no jq.
-#
-# Usage:  ./scan-logs-for-credentials.sh
+Scope
 
-# ===================== PARAMETERS – EDIT THESE =====================
-ID_FILE="instance-ids.txt"               # one instance ID per line
-LOG_GROUP="/dna/instance-logs"           # log group to search
-STREAM_PREFIX_TEMPLATE="standalone/%s/"  # how a stream name starts; %s = instance ID
-DAYS=7                                    # how far back to look
-REPORT_FILE="credential-findings.txt"     # readable report
+Log group: /dna/instance-logs
+Streams scoped per instance via standalone/<instance-id>/ prefix (required given the group holds ~10k streams)
+Window: last 7 days of events per instance
+Included command-history content (history.log) wherever it is multiplexed into the per-instance streams
 
-# Coarse server-side pre-filter: ask CloudWatch to return only events that
-# contain one of these terms, to cut data transfer and avoid throttling.
-# CASE-SENSITIVE and term-based. Set to "" for an exhaustive (slower) scan
-# that pulls every event and filters entirely locally.
-SERVER_FILTER_PATTERN='?password ?Password ?PASSWORD ?passwd ?passphrase ?secret ?Secret ?SASL ?sasl ?AUTH ?auth ?LOGIN ?login ?Authorization ?Proxy-Authorization ?Basic ?htpasswd ?community ?rocommunity ?rwcommunity ?BEGIN ?apr1 ?SSHA'
-# ===================================================================
+Credential patterns searched
 
-export AWS_RETRY_MODE=adaptive
-export AWS_MAX_ATTEMPTS=10
+Category	What was matched
+Generic secrets	password/passwd/pwd/passphrase/secret with an assigned value
+Mail (postfix/dovecot)	sasl_username/sasl_password, SMTP AUTH PLAIN/AUTH LOGIN base64 blobs, dovecot auth lines
+Proxy (squid)	Proxy-Authorization, proxy_auth, ncsa_auth lines
+HTTP basic auth	Authorization: Basic <base64>
+URLs with embedded creds	scheme://user:pass@host
+Password hashes	$apr1$, $1$/$5$/$6$, {SSHA}/{SHA}
+SNMP	community/rocommunity/rwcommunity strings
+DNS (dnsmasq/BIND)	TSIG keys, secret "..."
+Private keys	-----BEGIN ... PRIVATE KEY----- blocks
+CLI-flag creds (from history)	-p<val>/--password, curl -u, redis-cli -a, PGPASSWORD=/MYSQL_PWD=, htpasswd -b, doveadm pw -p, openssl ... pass:
 
-command -v aws  >/dev/null 2>&1 || { echo "ERROR: aws CLI not found" >&2; exit 1; }
-command -v awk  >/dev/null 2>&1 || { echo "ERROR: awk not found"     >&2; exit 1; }
-[[ -f "$ID_FILE" ]]             || { echo "ERROR: ID file not found: $ID_FILE" >&2; exit 1; }
+Limitations noted
 
-START_MS=$(( ( $(date +%s) - DAYS * 86400 ) * 1000 ))
-
-TMPDIR=$(mktemp -d)
-RAW="$TMPDIR/raw.tsv"
-: > "$RAW"
-trap 'rm -rf "$TMPDIR"' EXIT
-
-# ---- credential patterns (parallel arrays) --------------------------------
-# P_CI: 1 = case-insensitive grep, 0 = case-sensitive
-P_CI=(); P_LABEL=(); P_RE=()
-addp(){ P_CI+=("$1"); P_LABEL+=("$2"); P_RE+=("$3"); }
-
-addp 1 "Password / passphrase"          "(password|passwd|passphrase|pwd)[[:space:]\"']*[:=]"
-addp 1 "Secret value"                   "(secret|secret[_-]?key|shared[_-]?secret|client[_-]?secret)[[:space:]\"']*[:=]"
-addp 1 "Token / API key"                "(token|api[_-]?key|apikey|access[_-]?token|auth[_-]?token)[[:space:]\"']*[:=]"
-addp 0 "URL with embedded credentials"  "[a-zA-Z][a-zA-Z0-9+.-]*://[^/[:space:]:@]+:[^/[:space:]:@]+@"
-addp 1 "SMTP / SASL AUTH"               "(auth[[:space:]]+(plain|login)([[:space:]]+[a-z0-9+/=]{6,})?|sasl_passwd|sasl_password|smtp_sasl_password|sasl_username)"
-addp 0 "HTTP/Proxy Basic auth header"   "(Authorization|Proxy-Authorization)[[:space:]]*:[[:space:]]*Basic[[:space:]]+[A-Za-z0-9+/=]{6,}"
-addp 1 "Squid proxy auth config"        "(cachemgr_passwd|ncsa_auth|basic_ncsa_auth|htpasswd|auth_param[[:space:]]+basic)"
-addp 0 "Password hash"                  "([$](1|2[aby]|5|6|apr1)[$][./A-Za-z0-9$]{6,}|[{](SSHA|SHA|MD5|CRYPT|PLAIN)[}][A-Za-z0-9+/=]{4,})"
-addp 0 "Private key (PEM)"              "-----BEGIN ([A-Z]+ )?PRIVATE KEY-----"
-addp 1 "SNMP community string"          "(rocommunity6?|rwcommunity6?|com2sec)[[:space:]]+[^[:space:]]+"
-addp 1 "BIND / TSIG key secret"         "secret[[:space:]]+\"[A-Za-z0-9+/=]{8,}\""
-
-echo "Log group : $LOG_GROUP"
-echo "Window    : last $DAYS day(s)"
-echo "ID file   : $ID_FILE"
-[[ -n "$SERVER_FILTER_PATTERN" ]] && echo "Mode      : fast (server-side pre-filter ON)" \
-                                  || echo "Mode      : exhaustive (no server-side pre-filter)"
-echo
-
-# ---- fetch events per instance (scoped by stream prefix) ------------------
-count_ids=0
-while IFS= read -r id || [[ -n "$id" ]]; do
-  id="${id%%#*}"
-  id=$(printf '%s' "$id" | tr -d '[:space:]')
-  [[ -z "$id" ]] && continue
-  count_ids=$((count_ids + 1))
-
-  prefix=$(printf "$STREAM_PREFIX_TEMPLATE" "$id")
-  echo "Fetching $id  (streams matching '$prefix') ..."
-
-  args=(logs filter-log-events
-        --log-group-name "$LOG_GROUP"
-        --log-stream-name-prefix "$prefix"
-        --start-time "$START_MS"
-        --query 'events[*].[logStreamName,message]'
-        --output text)
-  [[ -n "$SERVER_FILTER_PATTERN" ]] && args+=(--filter-pattern "$SERVER_FILTER_PATTERN")
-
-  if ! aws "${args[@]}" > "$TMPDIR/$id.txt" 2> "$TMPDIR/$id.err"; then
-    echo "  !! error for $id: $(tr '\n' ' ' < "$TMPDIR/$id.err")"
-    rm -f "$TMPDIR/$id.txt"
-  fi
-  sleep 0.2
-done < "$ID_FILE"
-
-echo
-echo "Scanned $count_ids instance ID(s). Searching events ..."
-echo
-
-# ---- grep each instance's events against every pattern --------------------
-for f in "$TMPDIR"/*.txt; do
-  [[ -e "$f" ]] || continue
-  id=$(basename "$f" .txt)
-  idx=0
-  while [[ $idx -lt ${#P_RE[@]} ]]; do
-    ci=${P_CI[$idx]}; label=${P_LABEL[$idx]}; re=${P_RE[$idx]}
-    if [[ "$ci" == 1 ]]; then gopt="-iE"; else gopt="-E"; fi
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      stream=${line%%$'\t'*}
-      msg=${line#*$'\t'}
-      [[ "$stream" == "$line" ]] && { stream="(cont)"; msg="$line"; }
-      printf '%s\t%s\t%s\t%s\n' "$label" "$id" "$stream" "$msg" >> "$RAW"
-    done < <(grep $gopt -- "$re" "$f" 2>/dev/null)
-    idx=$((idx + 1))
-  done
-done
-
-EVENTS=$(cat "$TMPDIR"/*.txt 2>/dev/null | wc -l | tr -d ' ')
-RAWCOUNT=$(wc -l < "$RAW" | tr -d ' ')
-
-# ---- header (screen + file) -----------------------------------------------
-{
-  echo "========================================================================"
-  echo "CloudWatch credential scan"
-  echo "Log group     : $LOG_GROUP"
-  echo "Window        : last $DAYS day(s)"
-  echo "Generated     : $(date '+%Y-%m-%d %H:%M:%S %Z')"
-  echo "Events scanned: $EVENTS"
-  echo "Raw matches   : $RAWCOUNT"
-  echo "========================================================================"
-  echo
-} | tee "$REPORT_FILE"
-
-if [[ "$RAWCOUNT" -eq 0 ]]; then
-  echo "No credential patterns matched." | tee -a "$REPORT_FILE"
-  echo
-  echo "Report written to: $REPORT_FILE"
-  exit 0
-fi
-
-# ---- dedupe (by instance+label+message), count, group, report -------------
-# Sort so duplicates are adjacent: by instance, then label, then message.
-sort -t$'\t' -k2,2 -k1,1 -k4 "$RAW" | awk -F'\t' -v rf="$REPORT_FILE" '
-function emit(s){ print s; print s >> rf }
-function flush(){
-  if (pk == "") return
-  rep = (pc > 1) ? " (x" pc ")" : ""
-  if (pinst != lastinst){ emit("########## instance: " pinst " ##########"); emit(""); lastinst=pinst }
-  emit("[" plabel "]" rep)
-  emit("  stream : " pstream)
-  emit("  line   : " pmsg)
-  emit("")
-  typec[plabel]++
-  instc[pinst]++
-}
-{
-  label=$1; inst=$2; stream=$3
-  msg=$4; for(i=5;i<=NF;i++) msg=msg "\t" $i
-  key=inst SUBSEP label SUBSEP msg
-  if (key != pk){ flush(); pk=key; pc=0; plabel=label; pinst=inst; pstream=stream; pmsg=msg }
-  pc++
-}
-END{
-  flush()
-  emit("========================================================================")
-  emit("SUMMARY — unique findings by type")
-  emit("========================================================================")
-  for (t in typec) printf "  %4d  %s\n", typec[t], t | "sort -rn"
-  close("sort -rn")
-  emit("")
-  emit("SUMMARY — unique findings by instance")
-  for (ii in instc) emit(sprintf("  %4d  %s", instc[ii], ii))
-}'
-
-echo
-echo "Report written to: $REPORT_FILE"
+Interactive password prompts don’t appear in history (read from TTY, not command line)
+Lines prefixed with a space may be absent if HISTCONTROL=ignorespace was set
+Base64 AUTH blobs are flagged but need decoding to confirm

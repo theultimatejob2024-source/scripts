@@ -1,26 +1,253 @@
-Scope
+#!/usr/bin/env bash
+#
+# scan-ecs-logs-for-credentials.sh
+#
+# Scan CloudWatch log groups (ECS cluster services + Spring Boot app logs) for
+# exposed infrastructure and application credentials over a recent time window.
+# The goal is to FIND exposed credentials so they can be rotated.
+#
+# Pure Bash: uses only the `aws` CLI (incl. its built-in --query/JMESPath),
+# grep, sed, awk. No Python, no jq.
+#
+# Input   : a file of log group names, one per line (LOG_GROUP_FILE).
+#           A line may optionally be
+#               <log-group-name><TAB><stream-name-prefix>
+#           to scope a large group to specific streams (avoids throttling the
+#           way /dna/instance-logs did). No tab => scan the whole group.
+#           Blank lines and lines beginning with # are ignored.
+#
+# Output  : grouped, deduped report (log group -> category -> line + count)
+#           written to screen and to REPORT_FILE, plus a summary.
+#
+# -----------------------------------------------------------------------------
+# Parameters (override via environment, or edit the defaults here)
+# -----------------------------------------------------------------------------
+LOG_GROUP_FILE="${LOG_GROUP_FILE:-log_groups.txt}"
+DAYS="${DAYS:-7}"
+REPORT_FILE="${REPORT_FILE:-ecs-credential-scan-report.txt}"
+REGION="${REGION:-}"                                 # e.g. eu-west-1; blank = CLI default
+SERVER_FILTER_PATTERN="${SERVER_FILTER_PATTERN:-}"   # optional server-side CloudWatch
+                                                     # --filter-pattern to cut volume /
+                                                     # throttling; blank = exhaustive scan
+SELFTEST_FILE="${SELFTEST_FILE:-}"                   # if set, read events from this local
+                                                     # file instead of calling AWS (offline
+                                                     # pattern validation)
 
-Log group: /dna/instance-logs
-Streams scoped per instance via standalone/<instance-id>/ prefix (required given the group holds ~10k streams)
-Window: last 7 days of events per instance
-Included command-history content (history.log) wherever it is multiplexed into the per-instance streams
+export AWS_RETRY_MODE="${AWS_RETRY_MODE:-adaptive}"
+export AWS_MAX_ATTEMPTS="${AWS_MAX_ATTEMPTS:-10}"
 
-Credential patterns searched
+# -----------------------------------------------------------------------------
+# Credential patterns.  TYPES[i] <-> REGEXES[i] (kept as parallel arrays so the
+# regexes stay in single quotes and no backslash gets mangled).
+# All matched with `grep -hiE` (extended, case-insensitive).
+# -----------------------------------------------------------------------------
+TYPES=(
+  # --- reused from Script 2 (infra services) ---------------------------------
+  GENERIC_PASSWORD
+  GENERIC_SECRET
+  MAIL_SASL
+  SMTP_AUTH_BLOB
+  SQUID_PROXY_AUTH
+  HTTP_BASIC_AUTH
+  URL_EMBEDDED_CRED
+  HASH_CRYPT
+  HASH_LDAP
+  SNMP_COMMUNITY
+  DNS_TSIG_SECRET
+  PEM_PRIVATE_KEY
+  # --- CLI-flag / shell-history creds ----------------------------------------
+  CLI_PASSWORD_FLAG
+  CLI_CURL_USERPASS
+  CLI_REDIS_AUTH
+  ENV_INLINE_SECRET
+  CLI_HTPASSWD_B
+  CLI_DOVEADM_PW
+  CLI_OPENSSL_PASS
+  # --- NEW: Spring Boot / Java application ------------------------------------
+  SPRING_PROP_SECRET
+  SPRING_DATASOURCE_PW
+  JDBC_URL_QUERY_CRED
+  JDBC_URL_USERINFO
+  JAVA_KEYSTORE_PW
+  JAVA_SSL_DPROP
+  JVM_DPROP_SECRET
+  JWT_TOKEN
+  BEARER_TOKEN
+  KAFKA_JAAS_PW
+  OAUTH_CLIENT_SECRET
+)
+REGEXES=(
+  # --- reused from Script 2 ---------------------------------------------------
+  '(password|passwd|pwd|passphrase)[[:space:]]*[:=][[:space:]]*[^[:space:]]+'
+  '(secret|api[_-]?secret|client[_-]?secret)[[:space:]]*[:=][[:space:]]*[^[:space:]]+'
+  'sasl_(username|password)[[:space:]]*=[[:space:]]*[^[:space:]]+'
+  'AUTH[[:space:]]+(PLAIN|LOGIN)[[:space:]]+[A-Za-z0-9+/=]{8,}'
+  '(proxy-authorization|proxy_auth)[[:space:]]*[:=][[:space:]]*[^[:space:]]+'
+  'authorization:[[:space:]]*basic[[:space:]]+[A-Za-z0-9+/=]+'
+  '[a-z][a-z0-9+.-]*://[^/[:space:]:@]+:[^/[:space:]:@]+@'
+  '\$(apr1|1|5|6|2[aby]?)\$[^[:space:]]+'
+  '\{s?sha[0-9]*\}[A-Za-z0-9+/=]+'
+  '(^|[[:space:]])(ro|rw)?community[[:space:]]+[^[:space:]]+'
+  'secret[[:space:]]+"[A-Za-z0-9+/=]{8,}"'
+  '-----BEGIN ([A-Z0-9]+ )?PRIVATE KEY-----'
+  # --- CLI-flag / shell-history ----------------------------------------------
+  '(--password|--pass)[=[:space:]][^[:space:]]+|(mysql|mysqldump|mariadb)[^#]*[[:space:]]-p[^[:space:]=]+'
+  'curl[[:space:]].*(-u|--user)[[:space:]]+[^[:space:]]+'
+  'redis-cli[[:space:]].*-a[[:space:]]+[^[:space:]]+'
+  '(pgpassword|mysql_pwd|[a-z0-9_]*password|[a-z0-9_]*secret|[a-z0-9_]*token)=[^[:space:]]+'
+  'htpasswd[[:space:]].*-b[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+'
+  'doveadm[[:space:]]+pw[[:space:]].*-p[[:space:]]+[^[:space:]]+'
+  'pass:[^[:space:]]+'
+  # --- Spring Boot / Java -----------------------------------------------------
+  'spring\.[a-z0-9._-]*(password|secret)[[:space:]]*[:=][[:space:]]*[^[:space:]]+'
+  '(spring\.datasource\.password|spring_datasource_password)[[:space:]]*[:=][[:space:]]*[^[:space:]]+'
+  'jdbc:[a-z0-9]+://[^[:space:]]*(password|passwd|user)=[^[:space:]&"'"'"']+'
+  'jdbc:[a-z0-9]+://[^/[:space:]:@]+:[^/[:space:]:@]+@'
+  '(keystorepassword|truststorepassword|key-store-password|trust-store-password)[[:space:]]*[:=][[:space:]]*[^[:space:]]+'
+  '-djavax\.net\.ssl\.(keystore|truststore)password=[^[:space:]]+'
+  '-d[a-z0-9._]*(password|passwd|pwd|secret|token)=[^[:space:]]+'
+  'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'
+  'authorization:[[:space:]]*bearer[[:space:]]+[A-Za-z0-9._-]+'
+  '(sasl\.jaas\.config|loginmodule).*password[[:space:]]*=[[:space:]]*"?[^[:space:]"]+'
+  'client[_-]secret[[:space:]]*[:=][[:space:]]*[^[:space:]]+'
+)
 
-Category	What was matched
-Generic secrets	password/passwd/pwd/passphrase/secret with an assigned value
-Mail (postfix/dovecot)	sasl_username/sasl_password, SMTP AUTH PLAIN/AUTH LOGIN base64 blobs, dovecot auth lines
-Proxy (squid)	Proxy-Authorization, proxy_auth, ncsa_auth lines
-HTTP basic auth	Authorization: Basic <base64>
-URLs with embedded creds	scheme://user:pass@host
-Password hashes	$apr1$, $1$/$5$/$6$, {SSHA}/{SHA}
-SNMP	community/rocommunity/rwcommunity strings
-DNS (dnsmasq/BIND)	TSIG keys, secret "..."
-Private keys	-----BEGIN ... PRIVATE KEY----- blocks
-CLI-flag creds (from history)	-p<val>/--password, curl -u, redis-cli -a, PGPASSWORD=/MYSQL_PWD=, htpasswd -b, doveadm pw -p, openssl ... pass:
+# -----------------------------------------------------------------------------
+# Setup
+# -----------------------------------------------------------------------------
+US=$'\037'   # unit separator, used to delimit fields in temp files
 
-Limitations noted
+if [ ! -f "$LOG_GROUP_FILE" ]; then
+  echo "ERROR: log group file not found: $LOG_GROUP_FILE" >&2
+  exit 1
+fi
+if [ "${#TYPES[@]}" -ne "${#REGEXES[@]}" ]; then
+  echo "ERROR: TYPES/REGEXES arrays out of sync (${#TYPES[@]} vs ${#REGEXES[@]})" >&2
+  exit 1
+fi
 
-Interactive password prompts don’t appear in history (read from TTY, not command line)
-Lines prefixed with a space may be absent if HISTCONTROL=ignorespace was set
-Base64 AUTH blobs are flagged but need decoding to confirm
+REGION_ARG=(); [ -n "$REGION" ] && REGION_ARG=(--region "$REGION")
+FILTER_ARG=(); [ -n "$SERVER_FILTER_PATTERN" ] && FILTER_ARG=(--filter-pattern "$SERVER_FILTER_PATTERN")
+
+START_MS=$(( ( $(date +%s) - DAYS * 86400 ) * 1000 ))
+
+TMPDIR_RUN="$(mktemp -d)"
+RAWFILE="$TMPDIR_RUN/raw.log"
+HITS="$TMPDIR_RUN/hits"
+ALLHITS="$TMPDIR_RUN/allhits"
+: > "$ALLHITS"
+trap 'rm -rf "$TMPDIR_RUN"' EXIT
+
+: > "$REPORT_FILE"
+
+emit() { tee -a "$REPORT_FILE"; }   # write to screen + report file
+
+# fetch_events <group> <prefix>  -> writes event messages (one-ish per line) to RAWFILE
+fetch_events() {
+  local group="$1" prefix="$2"
+  if [ -n "$SELFTEST_FILE" ]; then
+    cat "$SELFTEST_FILE" > "$RAWFILE"
+    return 0
+  fi
+  local prefix_arg=()
+  [ -n "$prefix" ] && prefix_arg=(--log-stream-name-prefix "$prefix")
+  aws "${REGION_ARG[@]}" logs filter-log-events \
+      --log-group-name "$group" \
+      "${prefix_arg[@]}" \
+      --start-time "$START_MS" \
+      "${FILTER_ARG[@]}" \
+      --query 'events[].message' \
+      --output text 2> "$TMPDIR_RUN/err" > "$RAWFILE"
+}
+
+# -----------------------------------------------------------------------------
+# Scan
+# -----------------------------------------------------------------------------
+{
+  echo "CloudWatch credential scan"
+  echo "Date        : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  echo "Groups file : $LOG_GROUP_FILE"
+  echo "Window      : last $DAYS days (since epoch-ms $START_MS)"
+  [ -n "$REGION" ]                && echo "Region      : $REGION"
+  [ -n "$SERVER_FILTER_PATTERN" ] && echo "Pre-filter  : $SERVER_FILTER_PATTERN (server-side)"
+  [ -n "$SELFTEST_FILE" ]         && echo "MODE        : SELFTEST (reading $SELFTEST_FILE, no AWS calls)"
+  echo
+} | emit
+
+while IFS= read -r rawline || [ -n "$rawline" ]; do
+  # skip blanks / comments
+  case "$rawline" in ''|\#*) continue ;; esac
+  # split optional tab-separated stream prefix
+  GROUP="${rawline%%$'\t'*}"
+  if [ "$GROUP" != "$rawline" ]; then PREFIX="${rawline#*$'\t'}"; else PREFIX=""; fi
+  # trim surrounding whitespace on the group name
+  GROUP="$(printf '%s' "$GROUP" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  [ -z "$GROUP" ] && continue
+
+  echo ">> scanning: $GROUP ${PREFIX:+(prefix: $PREFIX)}" >&2
+
+  if ! fetch_events "$GROUP" "$PREFIX"; then
+    {
+      echo "============================================================"
+      echo "LOG GROUP: $GROUP"
+      echo "  ERROR fetching events:"
+      sed 's/^/    /' "$TMPDIR_RUN/err" 2>/dev/null | head -n 5
+      echo "============================================================"
+    } | emit
+    continue
+  fi
+
+  # match every pattern, tag each hit with its TYPE
+  : > "$HITS"
+  for i in "${!TYPES[@]}"; do
+    TYPE="${TYPES[$i]}"; REGEX="${REGEXES[$i]}"
+    while IFS= read -r line; do
+      printf '%s%s%s\n' "$TYPE" "$US" "$line"              >> "$HITS"
+      printf '%s%s%s%s%s\n' "$GROUP" "$US" "$TYPE" "$US" "$line" >> "$ALLHITS"
+    done < <(grep -hiE -e "$REGEX" "$RAWFILE" 2>/dev/null)
+  done
+
+  if [ ! -s "$HITS" ]; then
+    continue   # nothing found in this group; stay quiet
+  fi
+
+  {
+    echo "============================================================"
+    echo "LOG GROUP: $GROUP"
+    [ -n "$PREFIX" ] && echo "STREAM PREFIX: $PREFIX"
+    echo "============================================================"
+    # group by TYPE, dedupe identical lines, show counts
+    sort "$HITS" | uniq -c | awk -v US="$US" '
+      BEGIN { FS = US }
+      {
+        meta = $1; line = $2
+        sub(/^[[:space:]]+/, "", meta)
+        sp = index(meta, " ")
+        count = substr(meta, 1, sp - 1)
+        type  = substr(meta, sp + 1)
+        if (type != prev) { printf "\n  [%s]\n", type; prev = type }
+        printf "    (x%s) %s\n", count, line
+      }'
+    echo
+  } | emit
+done < "$LOG_GROUP_FILE"
+
+# -----------------------------------------------------------------------------
+# Summary
+# -----------------------------------------------------------------------------
+{
+  echo "============================================================"
+  echo "SUMMARY — unique findings per category (all groups)"
+  echo "============================================================"
+  if [ -s "$ALLHITS" ]; then
+    sort -u "$ALLHITS" | awk -v US="$US" 'BEGIN{FS=US}{print $2}' \
+      | sort | uniq -c | sort -rn | awk '{printf "  %6s  %s\n", $1, $2}'
+    echo
+    echo "  groups with findings: $(awk -v US="$US" 'BEGIN{FS=US}{print $1}' "$ALLHITS" | sort -u | wc -l)"
+    echo "  unique findings total: $(sort -u "$ALLHITS" | wc -l)"
+  else
+    echo "  No credential-pattern matches found."
+  fi
+  echo
+  echo "Report written to: $REPORT_FILE"
+} | emit

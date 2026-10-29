@@ -1,228 +1,35 @@
-#!/usr/bin/env bash
-#
-# triage-credential-report.sh
-#
-# Investigate the output of scan-ecs-logs-for-credentials.sh without drowning in
-# giant Java log lines. Works ON the report file (not CloudWatch) — safe to run
-# repeatedly, read-only.
-#
-# Pure Bash: grep, sed, awk, cut, sort, base64. No Python, no jq.
-#
-# USAGE
-#   ./triage-credential-report.sh [REPORT_FILE]          # guided menu (start here)
-#   ./triage-credential-report.sh overview [REPORT_FILE] # categories + counts + signal tier
-#   ./triage-credential-report.sh show   CATEGORY [FILE]  # trimmed, masked-filtered view
-#   ./triage-credential-report.sh tokens CATEGORY [FILE]  # deduped NAME=value secrets
-#   ./triage-credential-report.sh context CATEGORY [FILE] # match + a window of context
-#   ./triage-credential-report.sh names  CATEGORY [FILE]  # tally of variable/key names
-#   ./triage-credential-report.sh types  CATEGORY [FILE]  # what KIND of log line (prefix)
-#   ./triage-credential-report.sh decode CATEGORY [FILE]  # base64 / JWT decode helper
-#
-# CATEGORY is e.g. ENV_INLINE_SECRET, or ALL for every category at once.
-# -----------------------------------------------------------------------------
+Credential exposure scan — CloudWatch logs
 
-DEFAULT_REPORT="ecs-credential-scan-report.txt"
+Purpose. Identify plaintext or otherwise usable credentials that have been written into CloudWatch logs, so that anything exposed can be rotated.
 
-# Values that are masked / placeholder / default — i.e. NOT a real leaked secret.
-MASK_RE='([:=][[:space:]]*)(\*{2,}|x{3,}|redacted|censored|hidden|null|none|changeit|<[^>]*>|\$\{[^}]*\}|%[a-z_]+%)([[:space:]"'"'"';,}]|$)'
+Data source. CloudWatch log groups listed in log_groups.txt — the ECS cluster service logs and the Spring Boot application logs. (For the earlier infra-box pass: log group /dna/instance-logs, scoped per instance via the standalone/<instance-id>/ stream prefix.)
 
-# Signal tiers — which categories are worth looking at first.
-HIGH="JDBC_URL_USERINFO JDBC_URL_QUERY_CRED SPRING_DATASOURCE_PW MAIL_SASL URL_EMBEDDED_CRED KAFKA_JAAS_PW OAUTH_CLIENT_SECRET SNMP_COMMUNITY DNS_TSIG_SECRET PEM_PRIVATE_KEY CLI_PASSWORD_FLAG CLI_CURL_USERPASS CLI_REDIS_AUTH CLI_HTPASSWD_B CLI_DOVEADM_PW CLI_OPENSSL_PASS SQUID_PROXY_AUTH"
-MED="HTTP_BASIC_AUTH SMTP_AUTH_BLOB BEARER_TOKEN JWT_TOKEN HASH_CRYPT HASH_LDAP JAVA_KEYSTORE_PW JAVA_SSL_DPROP JVM_DPROP_SECRET SPRING_PROP_SECRET"
-LOW="GENERIC_PASSWORD GENERIC_SECRET ENV_INLINE_SECRET"
+Time window. Last 7 days of events per log group.
 
-tier_of() {
-  case " $HIGH " in *" $1 "*) echo "HIGH"; return;; esac
-  case " $MED  " in *" $1 "*) echo "MED";  return;; esac
-  case " $LOW  " in *" $1 "*) echo "LOW";  return;; esac
-  echo "?"
-}
+Method. Each log group’s events for the window were retrieved with aws logs filter-log-events and matched against a fixed set of case-insensitive regular-expression patterns covering infrastructure-service and application credentials. Matches were grouped by log group and category, deduplicated by line with occurrence counts. AWS_RETRY_MODE=adaptive and per-instance/stream-prefix scoping were used to stay within CloudWatch API limits. (State here, accurately, how you actually ran it — e.g. the scanning script, or scoped interactive filter-log-events queries — since whoever validates will likely try to reproduce it.)
 
-# -----------------------------------------------------------------------------
-# Core: pull the content lines for one category (or ALL) out of the report,
-# stripping the "    (xN) " prefix. Everything else builds on this.
-# -----------------------------------------------------------------------------
-extract_category() {   # $1 = category or ALL
-  awk -v want="$1" '
-    /^  \[/      { c=$0; sub(/^[^[]*\[/,"",c); sub(/\].*$/,"",c); next }
-    /^    \(x/   {
-      if (want=="ALL" || c==want) {
-        line=$0; sub(/^    \(x[0-9]+\) /,"",line); print line
-      }
-    }
-  ' "$REPORT"
-}
+What was searched for.
 
-list_categories() {   # emits: "<count> <CATEGORY>"
-  awk '
-    /^  \[/    { c=$0; sub(/^[^[]*\[/,"",c); sub(/\].*$/,"",c); next }
-    /^    \(x/ { cnt[c]++ }
-    END { for (k in cnt) printf "%d %s\n", cnt[k], k }
-  ' "$REPORT" | sort -rn
-}
+Category	What it catches
+Generic password / secret	password/passwd/pwd/passphrase and secret/client_secret with an assigned value
+Inline env secrets	PGPASSWORD=, MYSQL_PWD=, any *_PASSWORD/*_SECRET/*_TOKEN=
+CLI password flags (shell history)	mysql -p<val>, --password/--pass, curl -u user:pass, redis-cli -a, htpasswd -b, doveadm pw -p, openssl … pass:
+Mail (postfix/dovecot)	sasl_username/sasl_password, SMTP AUTH PLAIN/LOGIN base64 blobs
+Proxy (squid)	Proxy-Authorization, proxy_auth
+HTTP basic auth	Authorization: Basic <base64>
+Bearer / JWT	Authorization: Bearer …, JWT tokens (eyJ….eyJ….sig)
+URLs with embedded creds	scheme://user:pass@host
+Password hashes	$apr1$, $1$/$5$/$6$/$2y$, {SSHA}/{SHA}
+SNMP	community/rocommunity/rwcommunity strings
+DNS (dnsmasq/BIND)	TSIG / secret "…"
+Private keys	-----BEGIN … PRIVATE KEY-----
+Spring Boot / Java	spring.*.password/.secret, spring.datasource.password, JDBC URLs with creds (?user=&password= and user:pass@), keystore/truststore passwords, -Djavax.net.ssl.*Password, -D…password/secret/token=, Kafka SASL JAAS PlainLoginModule … password=, OAuth2 client-secret
 
-# -----------------------------------------------------------------------------
-# Views
-# -----------------------------------------------------------------------------
-view_overview() {
-  echo "Report: $REPORT"
-  echo "Categories present (most lines first). Start at the top of HIGH signal."
-  echo
-  printf "    %-6s %-22s %s\n" "LINES" "SIGNAL" "CATEGORY"
-  printf "    %-6s %-22s %s\n" "-----" "------" "--------"
-  list_categories | while read -r cnt cat; do
-    printf "    %-6s %-22s %s\n" "$cnt" "[$(tier_of "$cat") signal]" "$cat"
-  done
-  echo
-  echo "HIGH = a match is usually a real secret.  LOW = broad/noisy, lots of"
-  echo "masked or benign hits — triage last.  Then: show / tokens / context /"
-  echo "names / types / decode <CATEGORY>"
-}
+Known limitations (so results aren’t over-read).
 
-# Pull KEY=VALUE secret tokens out, one per match. Masking is applied at the
-# TOKEN level (not the line) so a real secret sharing a line with a placeholder
-# is not lost. Value stops at structural delimiters so no trailing }} , " junk.
-real_tokens() {   # $1 = category; emits cleaned, deduped KEY=VALUE
-  extract_category "$1" \
-    | grep -oiE '[A-Za-z0-9_.-]*(password|passwd|pwd|secret|token)[[:space:]]*[:=][[:space:]]*"?[^][[:space:],;"'"'"'{}<>()]+' \
-    | sed -E 's/[[:space:]]*[:=][[:space:]]*"?/=/' \
-    | grep -vEi '=(\*+|\$.*|<.*|%.*|null|none|changeit|redacted|censored|hidden|example)$' \
-    | grep -vE '=$' \
-    | sort -u
-}
-
-counts_line() {   # prints line/token counts for the category
-  local cat="$1" total real
-  total=$(extract_category "$cat" | grep -c .)
-  real=$(real_tokens "$cat" | grep -c .)
-  echo "report lines: $total | distinct real secrets after filtering: $real"
-}
-
-view_names() {
-  echo "# Variable / property names carrying a value (tally) — tells you WHAT leaked:"
-  extract_category "$1" \
-    | grep -oiE '[A-Za-z0-9_.-]*(password|passwd|pwd|secret|token)[[:space:]]*[:=]' \
-    | sed 's/[[:space:]]*[:=]$//' | sort | uniq -c | sort -rn
-}
-
-view_tokens() {
-  echo "# Deduped secrets (masked/placeholder removed). THIS is your rotation list:"
-  real_tokens "$1"
-}
-
-view_context() {
-  echo "# Each match with a small window of surrounding text (long lines trimmed):"
-  extract_category "$1" \
-    | grep -oiE '.{0,30}(password|passwd|pwd|secret|token)[[:space:]]*[:=][^[:space:],;"]{0,60}' \
-    | sort -u
-}
-
-view_types() {
-  echo "# Distinct log-line prefixes (first 100 chars) — tells you WHAT KIND of"
-  echo "# message it is (stack trace vs env dump vs config log):"
-  extract_category "$1" | cut -c1-100 | sort -u
-}
-
-pad_b64() {   # pad a base64url/base64 string to a multiple of 4
-  local s="$1"; s="${s//-/+}"; s="${s//_//}"
-  while [ $(( ${#s} % 4 )) -ne 0 ]; do s="${s}="; done
-  printf '%s' "$s"
-}
-
-view_decode() {
-  local cat="$1"
-  echo "# Basic / Proxy auth blobs -> user:pass"
-  extract_category "$cat" | grep -oiE '(basic|proxy-authorization:[[:space:]]*basic)[[:space:]]+[A-Za-z0-9+/=]+' \
-    | grep -oE '[A-Za-z0-9+/=]+$' | sort -u | while read -r b; do
-      printf '  %s  ->  ' "$b"; printf '%s' "$(pad_b64 "$b")" | base64 -d 2>/dev/null; echo
-    done
-  echo
-  echo "# SMTP AUTH PLAIN blobs -> contains \\0user\\0pass (control chars shown as ^@)"
-  extract_category "$cat" | grep -oiE 'AUTH[[:space:]]+PLAIN[[:space:]]+[A-Za-z0-9+/=]+' \
-    | grep -oE '[A-Za-z0-9+/=]+$' | sort -u | while read -r b; do
-      printf '  %s  ->  ' "$b"; printf '%s' "$(pad_b64 "$b")" | base64 -d 2>/dev/null | cat -v; echo
-    done
-  echo
-  echo "# JWT payloads (middle segment) — check \"exp\" to see if already expired:"
-  extract_category "$cat" | grep -oE 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+' | sort -u | while read -r j; do
-      payload="${j#*.}"
-      printf '  %s...  ->  ' "${j:0:20}"; printf '%s' "$(pad_b64 "$payload")" | base64 -d 2>/dev/null; echo
-    done
-}
-
-run_view() {   # $1 = view, $2 = category
-  case "$1" in
-    show)
-      echo "=== $2 ==="; counts_line "$2"; echo
-      view_names "$2";  echo
-      view_tokens "$2"; echo
-      echo "(run 'context $2' for surrounding text, 'decode $2' for base64/JWT, 'types $2' for line kinds)"
-      ;;
-    tokens)  view_tokens  "$2" ;;
-    context) view_context "$2" ;;
-    names)   view_names   "$2" ;;
-    types)   view_types   "$2" ;;
-    decode)  view_decode  "$2" ;;
-    *) echo "unknown view: $1" >&2; return 1 ;;
-  esac
-}
-
-# -----------------------------------------------------------------------------
-# Guided interactive menu
-# -----------------------------------------------------------------------------
-menu() {
-  while :; do
-    echo; view_overview; echo
-    # numbered pick list
-    mapfile -t CATS < <(list_categories | awk '{print $2}')
-    local i=1
-    for c in "${CATS[@]}"; do printf "  %2d) %s\n" "$i" "$c"; i=$((i+1)); done
-    echo "   q) quit"
-    printf "Pick a category number to investigate: "
-    read -r pick || break
-    case "$pick" in
-      q|Q) break ;;
-      ''|*[!0-9]*) echo "enter a number, or q"; continue ;;
-    esac
-    [ "$pick" -ge 1 ] 2>/dev/null && [ "$pick" -le "${#CATS[@]}" ] || { echo "out of range"; continue; }
-    local cat="${CATS[$((pick-1))]}"
-    while :; do
-      echo; run_view show "$cat"; echo
-      printf "[c]ontext  [d]ecode  [t]ypes  [n]ames  [b]ack  [q]uit : "
-      read -r sub || break 2
-      case "$sub" in
-        c) echo; view_context "$cat" ;;
-        d) echo; view_decode  "$cat" ;;
-        t) echo; view_types   "$cat" ;;
-        n) echo; view_names   "$cat" ;;
-        b) break ;;
-        q|Q) break 2 ;;
-        *) echo "?" ;;
-      esac
-      printf "\n(press Enter) "; read -r _ || break 2
-    done
-  done
-  echo "Reminder: keep the actual secret VALUES out of chat/tickets — share names and counts."
-}
-
-# -----------------------------------------------------------------------------
-# Dispatch
-# -----------------------------------------------------------------------------
-CMD="${1:-menu}"
-case "$CMD" in
-  menu|"")      REPORT="${2:-$DEFAULT_REPORT}" ;;
-  overview)     REPORT="${2:-$DEFAULT_REPORT}" ;;
-  show|tokens|context|names|types|decode)
-                CAT="$2"; REPORT="${3:-$DEFAULT_REPORT}" ;;
-  -h|--help|help) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-  *)            echo "unknown command: $CMD (try --help)" >&2; exit 1 ;;
-esac
-
-[ -f "$REPORT" ] || { echo "ERROR: report file not found: $REPORT" >&2; exit 1; }
-
-case "$CMD" in
-  menu|"")  if [ -t 0 ]; then menu; else view_overview; echo; echo "(not a terminal — use subcommands, see --help)"; fi ;;
-  overview) view_overview ;;
-  *)        [ -n "$CAT" ] || { echo "ERROR: $CMD needs a CATEGORY (or ALL). See 'overview'." >&2; exit 1; }
-            run_view "$CMD" "$CAT" ;;
-esac
+Interactive password prompts (sudo, mysql -p with no value, SSH) are not captured — they’re read from the TTY, not the command line, so they never reach the logs.
+Shell-history lines may be absent if HISTCONTROL=ignorespace/ignoreboth was set on the host.
+Base64 blobs (AUTH PLAIN, Basic, JWTs) are flagged but not decoded; each needs decoding to confirm it’s a live credential.
+Multi-line secrets (PEM keys, stack traces) are detected on their first/header line, not reconstructed in full.
+Generic categories intentionally over-capture; findings require a human pass to separate real secrets from benign strings.
+A server-side pre-filter, if used, narrows events and can hide credential lines that don’t contain the filter term — runs intended as exhaustive were done with it blank.

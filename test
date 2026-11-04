@@ -1,35 +1,146 @@
-Credential exposure scan — CloudWatch logs
+#!/usr/bin/env bash
+#
+# download-logs-batch.sh
+#
+# Download the last N days of events for a list of CloudWatch log groups, one
+# file per group. Resumable: each group is marked done only on a clean finish,
+# so if temporary credentials expire part-way through you just refresh them and
+# re-run — already-completed groups are skipped, and a half-downloaded group is
+# redone from scratch (never left partial and marked done).
+#
+# Pure aws CLI + coreutils. No Python, no jq.
+#
+# USAGE
+#   ./download-logs-batch.sh                 # uses the defaults below
+#   LOG_GROUP_FILE=groups.txt DAYS=31 ./download-logs-batch.sh
+#
+# INPUT
+#   LOG_GROUP_FILE: one log group name per line. Blank lines and #comments
+#   ignored. A line may optionally be "<group><TAB><stream-name-prefix>" to
+#   scope a large group (e.g. /dna/instance-logs) and avoid throttling.
+# -----------------------------------------------------------------------------
+LOG_GROUP_FILE="${LOG_GROUP_FILE:-log_groups.txt}"
+OUTDIR="${OUTDIR:-cwlogs}"
+DAYS="${DAYS:-31}"
+REGION="${REGION:-}"                       # e.g. eu-west-1; blank = CLI default
+DONE_FILE="${DONE_FILE:-$OUTDIR/.download-done.txt}"
+FAILED_FILE="${FAILED_FILE:-$OUTDIR/.download-failed.txt}"
 
-Purpose. Identify plaintext or otherwise usable credentials that have been written into CloudWatch logs, so that anything exposed can be rotated.
+export AWS_RETRY_MODE="${AWS_RETRY_MODE:-adaptive}"
+export AWS_MAX_ATTEMPTS="${AWS_MAX_ATTEMPTS:-10}"
 
-Data source. CloudWatch log groups listed in log_groups.txt — the ECS cluster service logs and the Spring Boot application logs. (For the earlier infra-box pass: log group /dna/instance-logs, scoped per instance via the standalone/<instance-id>/ stream prefix.)
+# -----------------------------------------------------------------------------
+mkdir -p "$OUTDIR"
+touch "$DONE_FILE" "$FAILED_FILE"
 
-Time window. Last 7 days of events per log group.
+if [ ! -f "$LOG_GROUP_FILE" ]; then
+  echo "ERROR: log group file not found: $LOG_GROUP_FILE" >&2
+  exit 1
+fi
 
-Method. Each log group’s events for the window were retrieved with aws logs filter-log-events and matched against a fixed set of case-insensitive regular-expression patterns covering infrastructure-service and application credentials. Matches were grouped by log group and category, deduplicated by line with occurrence counts. AWS_RETRY_MODE=adaptive and per-instance/stream-prefix scoping were used to stay within CloudWatch API limits. (State here, accurately, how you actually ran it — e.g. the scanning script, or scoped interactive filter-log-events queries — since whoever validates will likely try to reproduce it.)
+# GNU date (Linux). On macOS use: date -v-"${DAYS}"d +%s
+START_MS=$(( $(date -d "$DAYS days ago" +%s) * 1000 ))
+NOW_MS=$(( $(date +%s) * 1000 ))
 
-What was searched for.
+REGION_ARG=(); [ -n "$REGION" ] && REGION_ARG=(--region "$REGION")
 
-Category	What it catches
-Generic password / secret	password/passwd/pwd/passphrase and secret/client_secret with an assigned value
-Inline env secrets	PGPASSWORD=, MYSQL_PWD=, any *_PASSWORD/*_SECRET/*_TOKEN=
-CLI password flags (shell history)	mysql -p<val>, --password/--pass, curl -u user:pass, redis-cli -a, htpasswd -b, doveadm pw -p, openssl … pass:
-Mail (postfix/dovecot)	sasl_username/sasl_password, SMTP AUTH PLAIN/LOGIN base64 blobs
-Proxy (squid)	Proxy-Authorization, proxy_auth
-HTTP basic auth	Authorization: Basic <base64>
-Bearer / JWT	Authorization: Bearer …, JWT tokens (eyJ….eyJ….sig)
-URLs with embedded creds	scheme://user:pass@host
-Password hashes	$apr1$, $1$/$5$/$6$/$2y$, {SSHA}/{SHA}
-SNMP	community/rocommunity/rwcommunity strings
-DNS (dnsmasq/BIND)	TSIG / secret "…"
-Private keys	-----BEGIN … PRIVATE KEY-----
-Spring Boot / Java	spring.*.password/.secret, spring.datasource.password, JDBC URLs with creds (?user=&password= and user:pass@), keystore/truststore passwords, -Djavax.net.ssl.*Password, -D…password/secret/token=, Kafka SASL JAAS PlainLoginModule … password=, OAuth2 client-secret
+# strings in CLI stderr that mean "your credentials are gone" -> stop, don't
+# churn through every remaining group failing identically.
+EXPIRY_RE='ExpiredToken|ExpiredTokenException|RequestExpired|InvalidClientTokenId|UnrecognizedClientException|security token.*(expired|invalid)|The provided token has expired|credentials.*(expired|not|invalid)'
 
-Known limitations (so results aren’t over-read).
+safe_name() { printf '%s' "$1" | sed 's#[/ ]#_#g; s/\t/__/g'; }
 
-Interactive password prompts (sudo, mysql -p with no value, SSH) are not captured — they’re read from the TTY, not the command line, so they never reach the logs.
-Shell-history lines may be absent if HISTCONTROL=ignorespace/ignoreboth was set on the host.
-Base64 blobs (AUTH PLAIN, Basic, JWTs) are flagged but not decoded; each needs decoding to confirm it’s a live credential.
-Multi-line secrets (PEM keys, stack traces) are detected on their first/header line, not reconstructed in full.
-Generic categories intentionally over-capture; findings require a human pass to separate real secrets from benign strings.
-A server-side pre-filter, if used, narrows events and can hide credential lines that don’t contain the filter term — runs intended as exhaustive were done with it blank.
+# counters
+n_done=0; n_skip=0; n_fail=0
+
+echo "Batch download: last $DAYS days  (since epoch-ms $START_MS)"
+echo "Groups file : $LOG_GROUP_FILE"
+echo "Output dir  : $OUTDIR"
+echo "Done marker : $DONE_FILE"
+echo
+
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in ''|\#*) continue ;; esac
+  # trim trailing whitespace/CR
+  line="$(printf '%s' "$line" | sed 's/[[:space:]]*$//')"
+  [ -z "$line" ] && continue
+
+  # optional tab-separated stream prefix
+  GROUP="${line%%$'\t'*}"
+  if [ "$GROUP" != "$line" ]; then PREFIX="${line#*$'\t'}"; else PREFIX=""; fi
+
+  SAFE="$(safe_name "$line")"
+  OUTFILE="$OUTDIR/$SAFE.log"
+  PARTFILE="$OUTDIR/$SAFE.partial"
+
+  # ---- resume check: done AND the file is actually present -------------------
+  if grep -Fxq -- "$line" "$DONE_FILE" && [ -f "$OUTFILE" ]; then
+    echo "skip (done): $line"
+    n_skip=$((n_skip+1))
+    continue
+  fi
+
+  echo ">> downloading: $GROUP ${PREFIX:+(prefix: $PREFIX)}"
+
+  PREFIX_ARG=(); [ -n "$PREFIX" ] && PREFIX_ARG=(--log-stream-name-prefix "$PREFIX")
+  ERR="$OUTDIR/.err.$$"
+
+  aws "${REGION_ARG[@]}" logs filter-log-events \
+      --log-group-name "$GROUP" \
+      "${PREFIX_ARG[@]}" \
+      --start-time "$START_MS" \
+      --end-time "$NOW_MS" \
+      --query 'events[].message' \
+      --output text \
+      > "$PARTFILE" 2> "$ERR"
+  rc=$?
+
+  if [ "$rc" -eq 0 ]; then
+    # clean finish -> commit: rename, then record done
+    mv -f "$PARTFILE" "$OUTFILE"
+    printf '%s\n' "$line" >> "$DONE_FILE"
+    # drop any stale failed-entry for this line
+    grep -Fxv -- "$line" "$FAILED_FILE" > "$FAILED_FILE.tmp" 2>/dev/null \
+      && mv -f "$FAILED_FILE.tmp" "$FAILED_FILE"
+    echo "   done: $(wc -l < "$OUTFILE") lines -> $OUTFILE"
+    n_done=$((n_done+1))
+    rm -f "$ERR"
+    continue
+  fi
+
+  # non-zero: is it credential expiry? then stop cleanly so a re-run resumes.
+  rm -f "$PARTFILE"
+  if grep -qiE "$EXPIRY_RE" "$ERR"; then
+    echo >&2
+    echo "=============================================================" >&2
+    echo "CREDENTIALS EXPIRED while on: $line" >&2
+    sed 's/^/   /' "$ERR" | head -n 3 >&2
+    echo "-------------------------------------------------------------" >&2
+    echo "Refresh your temporary credentials and re-run the SAME command." >&2
+    echo "$n_done completed this run are recorded; they will be skipped." >&2
+    echo "=============================================================" >&2
+    rm -f "$ERR"
+    exit 2
+  fi
+
+  # other error (throttling exhausted, access denied on one group, etc.):
+  # record it and keep going so one bad group doesn't block the rest.
+  echo "   FAILED (rc=$rc): $line  — see below, continuing" >&2
+  sed 's/^/     /' "$ERR" | head -n 3 >&2
+  grep -Fxq -- "$line" "$FAILED_FILE" || printf '%s\n' "$line" >> "$FAILED_FILE"
+  n_fail=$((n_fail+1))
+  rm -f "$ERR"
+done < "$LOG_GROUP_FILE"
+
+echo
+echo "============================================================"
+echo "Run summary"
+echo "  downloaded this run : $n_done"
+echo "  skipped (already done): $n_skip"
+echo "  failed (non-auth)   : $n_fail"
+echo "  total recorded done : $(grep -c . "$DONE_FILE")"
+[ "$n_fail" -gt 0 ] && echo "  failed groups listed in: $FAILED_FILE"
+echo "============================================================"
+echo
+echo "Re-run any time: completed groups are skipped automatically."
+[ "$n_fail" -gt 0 ] && echo "Failed (non-auth) groups are NOT marked done, so a re-run retries them."

@@ -1,126 +1,360 @@
-#!/usr/bin/env bash
+# trivy-secret.yaml
+# Custom Trivy secret-scanning rules ported from scan-ecs-logs-for-credentials.sh
+# so Trivy catches the INFRA-service and Spring Boot/Java credentials that its
+# built-in rules (tuned for cloud/SaaS tokens) do not.
 #
-# scan-logs-trivy.sh
+# Use:  trivy fs --scanners secret --secret-config trivy-secret.yaml <path>
+# (scan-logs-trivy.sh picks this file up automatically if it's in the CWD.)
 #
-# Scan a directory of (possibly huge) CloudWatch log files for secrets with
-# Trivy, one file at a time: chunk a log into small line-whole pieces so none
-# trips Trivy's "file too large" skip, scan the chunks, save the result, then
-# delete the chunks before moving to the next log. Disk never holds more than
-# one log's chunks at a time.
-#
-# Resumable: a log is recorded done only after it scans cleanly, so a re-run
-# skips finished logs (handy if a run is interrupted).
-#
-# USAGE
-#   ./scan-logs-trivy.sh [LOGDIR]            # defaults to cwlogs
-#   CHUNK_SIZE=10M OUTDIR=results ./scan-logs-trivy.sh cwlogs
-#
-# If a trivy-secret.yaml exists (or SECRET_CONFIG points to one) it is passed
-# to Trivy so your custom infra-cred rules run alongside the built-ins.
-# -----------------------------------------------------------------------------
-LOGDIR="${1:-${LOGDIR:-cwlogs}}"
-OUTDIR="${OUTDIR:-trivy-results}"
-CHUNK_SIZE="${CHUNK_SIZE:-5M}"             # whole-line chunks; stays under Trivy's limit
-SECRET_CONFIG="${SECRET_CONFIG:-trivy-secret.yaml}"
-CHUNK_ROOT="${CHUNK_ROOT:-$OUTDIR/.chunks}"
-DONE_FILE="${DONE_FILE:-$OUTDIR/.scanned-done.txt}"
+# These ADD to Trivy's built-in rules; they don't replace them.
+# Each rule needs >=1 keyword: Trivy only runs the regex on a file when a
+# keyword is present, which keeps scanning fast. Regex is Go/RE2 syntax.
 
-# -----------------------------------------------------------------------------
-command -v trivy >/dev/null 2>&1 || { echo "ERROR: trivy not found on PATH" >&2; exit 1; }
-[ -d "$LOGDIR" ] || { echo "ERROR: log dir not found: $LOGDIR" >&2; exit 1; }
+rules:
+  # ---- generic ---------------------------------------------------------------
+  - id: infra-generic-password
+    category: InfraCreds
+    title: Generic password assignment
+    severity: HIGH
+    keywords: ["password", "passwd", "passphrase"]
+    regex: '(?i)(password|passwd|pwd|passphrase)\s*[:=]\s*\S+'
 
-mkdir -p "$OUTDIR"
-touch "$DONE_FILE"
+  - id: infra-generic-secret
+    category: InfraCreds
+    title: Generic secret / client secret
+    severity: HIGH
+    keywords: ["secret"]
+    regex: '(?i)(client[_-]?secret|api[_-]?secret|secret)\s*[:=]\s*\S+'
 
-# use custom rules only if the file is actually there
-CONFIG_ARG=()
-if [ -f "$SECRET_CONFIG" ]; then
-  CONFIG_ARG=(--secret-config "$SECRET_CONFIG")
-  echo "Using custom secret rules: $SECRET_CONFIG"
-else
-  echo "No $SECRET_CONFIG found — built-in rules only (cloud/SaaS tokens; infra creds may be missed)."
-fi
-echo "Log dir: $LOGDIR | chunk size: $CHUNK_SIZE | results: $OUTDIR"
-echo
+  - id: infra-env-inline-secret
+    category: InfraCreds
+    title: Inline env secret (PASSWORD/SECRET/TOKEN=)
+    severity: HIGH
+    keywords: ["PASSWORD", "SECRET", "TOKEN", "PGPASSWORD", "MYSQL_PWD"]
+    regex: '(?i)[a-z0-9_]*(password|secret|token)=\S+'
 
-# always clean up the scratch chunk dir, even on Ctrl-C
-cleanup() { rm -rf "$CHUNK_ROOT"; }
-trap cleanup EXIT
+  # ---- mail (postfix / dovecot) ---------------------------------------------
+  - id: infra-mail-sasl
+    category: InfraCreds
+    title: SASL username/password
+    severity: CRITICAL
+    keywords: ["sasl_"]
+    regex: '(?i)sasl_(username|password)\s*=\s*\S+'
 
-shopt -s nullglob
-logs=("$LOGDIR"/*.log)
-shopt -u nullglob
-if [ "${#logs[@]}" -eq 0 ]; then
-  echo "No *.log files in $LOGDIR" >&2; exit 1
-fi
+  - id: infra-smtp-auth-blob
+    category: InfraCreds
+    title: SMTP AUTH PLAIN/LOGIN base64 blob
+    severity: HIGH
+    keywords: ["AUTH PLAIN", "AUTH LOGIN"]
+    regex: 'AUTH (PLAIN|LOGIN)\s+[A-Za-z0-9+/=]{8,}'
 
-n_find=0; n_clean=0; n_skip=0; n_err=0
-: > "$OUTDIR/.findings-index.txt"
+  # ---- proxy / http ----------------------------------------------------------
+  - id: infra-squid-proxy-auth
+    category: InfraCreds
+    title: Proxy authorization
+    severity: HIGH
+    keywords: ["Proxy-Authorization", "proxy_auth"]
+    regex: '(?i)(proxy-authorization|proxy_auth)\s*[:=]\s*\S+'
 
-for f in "${logs[@]}"; do
-  base="$(basename "$f")"
+  - id: infra-http-basic-auth
+    category: InfraCreds
+    title: HTTP Basic auth header
+    severity: HIGH
+    keywords: ["Basic"]
+    regex: '(?i)authorization:\s*basic\s+[A-Za-z0-9+/=]+'
 
-  if grep -Fxq -- "$base" "$DONE_FILE"; then
-    echo "skip (done): $base"; n_skip=$((n_skip+1)); continue
-  fi
+  - id: infra-bearer-token
+    category: InfraCreds
+    title: Bearer token
+    severity: HIGH
+    keywords: ["Bearer"]
+    regex: '(?i)authorization:\s*bearer\s+[A-Za-z0-9._-]+'
 
-  echo "============================================================"
-  echo "LOG: $base  ($(du -h "$f" | cut -f1))"
+  - id: infra-jwt
+    category: InfraCreds
+    title: JWT (check exp)
+    severity: MEDIUM
+    keywords: ["eyJ"]
+    regex: 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'
 
-  # 1) chunk this one log into whole-line pieces
-  chunkdir="$CHUNK_ROOT/$base"
-  rm -rf "$chunkdir"; mkdir -p "$chunkdir"
-  split -C "$CHUNK_SIZE" -d --additional-suffix=.log "$f" "$chunkdir/part." 2>/dev/null \
-    || split -C "$CHUNK_SIZE" -d "$f" "$chunkdir/part."   # fallback if --additional-suffix unsupported
-  echo "  chunks: $(ls -1 "$chunkdir" | wc -l)"
+  - id: infra-url-embedded-cred
+    category: InfraCreds
+    title: URL with embedded user:pass
+    severity: CRITICAL
+    keywords: ["://"]
+    regex: '[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:[^/\s:@]+@'
 
-  # 2) scan the chunks -> JSON (authoritative, parseable without jq)
-  json="$OUTDIR/$base.json"
-  if ! trivy fs --scanners secret "${CONFIG_ARG[@]}" \
-        --format json --output "$json" "$chunkdir" 2> "$OUTDIR/.trivy.err"; then
-    echo "  ERROR scanning $base (left chunks in $chunkdir for inspection):" >&2
-    sed 's/^/    /' "$OUTDIR/.trivy.err" | head -n 5 >&2
-    n_err=$((n_err+1))
-    continue   # not marked done -> retried next run
-  fi
+  # ---- Spring Boot / Java ----------------------------------------------------
+  - id: infra-spring-datasource-pw
+    category: InfraCreds
+    title: Spring datasource password
+    severity: CRITICAL
+    keywords: ["datasource.password", "SPRING_DATASOURCE_PASSWORD"]
+    regex: '(?i)(spring\.datasource\.password|spring_datasource_password)\s*[:=]\s*\S+'
 
-  # 3) human-readable table from the same JSON (no re-scan)
-  txt="$OUTDIR/$base.txt"
-  trivy convert --format table --output "$txt" "$json" 2>/dev/null || cp "$json" "$txt"
+  - id: infra-spring-prop-secret
+    category: InfraCreds
+    title: Spring property password/secret
+    severity: HIGH
+    keywords: ["spring."]
+    regex: '(?i)spring\.[a-z0-9._-]*(password|secret)\s*[:=]\s*\S+'
 
-  # 4) findings? Trivy JSON puts each secret under a "RuleID"
-  hits=$(grep -c '"RuleID"' "$json" 2>/dev/null)
-  if [ "${hits:-0}" -gt 0 ]; then
-    echo "  >>> FINDINGS: $hits secret match(es)  (see $txt)"
-    printf '%s\t%s hits\n' "$base" "$hits" >> "$OUTDIR/.findings-index.txt"
-    n_find=$((n_find+1))
-  else
-    echo "  clean (no matches)"
-    n_clean=$((n_clean+1))
-  fi
+  - id: infra-jdbc-url-query-cred
+    category: InfraCreds
+    title: JDBC URL with password/user in query
+    severity: CRITICAL
+    keywords: ["jdbc:"]
+    regex: '(?i)jdbc:[a-z0-9]+://\S*(password|passwd|user)=[^\s&";]+'
 
-  # 5) record done and free the disk
-  printf '%s\n' "$base" >> "$DONE_FILE"
-  rm -rf "$chunkdir"
-done
+  - id: infra-jdbc-url-userinfo
+    category: InfraCreds
+    title: JDBC URL with user:pass@ userinfo
+    severity: CRITICAL
+    keywords: ["jdbc:"]
+    regex: '(?i)jdbc:[a-z0-9]+://[^/\s:@]+:[^/\s:@]+@'
 
-rm -f "$OUTDIR/.trivy.err"
+  - id: infra-keystore-password
+    category: InfraCreds
+    title: Java keystore/truststore password
+    severity: HIGH
+    keywords: ["storePassword", "store-password"]
+    regex: '(?i)(keystorepassword|truststorepassword|key-store-password|trust-store-password)\s*[:=]\s*\S+'
 
-echo
-echo "============================================================"
-echo "Summary"
-echo "  logs with findings : $n_find"
-echo "  clean logs         : $n_clean"
-echo "  skipped (done)     : $n_skip"
-echo "  errored            : $n_err"
-echo "============================================================"
-if [ "$n_find" -gt 0 ]; then
-  echo "Logs with secret matches:"
-  sed 's/^/  /' "$OUTDIR/.findings-index.txt"
-  echo "Per-log reports (.txt/.json) are in $OUTDIR/"
-fi
-echo
-echo "Re-run any time: finished logs are skipped. Errored logs are retried."
-echo "NOTE: built-in Trivy rules target cloud/SaaS tokens. For infra creds"
-echo "(sasl_password=, SNMP communities, dovecot hashes, JDBC...) add a"
-echo "trivy-secret.yaml, or also run your own scan-ecs-logs-for-credentials.sh."
+  - id: infra-java-ssl-dprop
+    category: InfraCreds
+    title: JVM -Djavax.net.ssl keystore/truststore password
+    severity: HIGH
+    keywords: ["javax.net.ssl"]
+    regex: '(?i)-Djavax\.net\.ssl\.(keyStore|trustStore)Password=\S+'
+
+  - id: infra-jvm-dprop-secret
+    category: InfraCreds
+    title: JVM -D system property secret
+    severity: HIGH
+    keywords: ["-D"]
+    regex: '(?i)-D[a-z0-9._]*(password|passwd|pwd|secret|token)=\S+'
+
+  - id: infra-kafka-jaas-pw
+    category: InfraCreds
+    title: Kafka SASL JAAS config password
+    severity: CRITICAL
+    keywords: ["jaas.config", "LoginModule"]
+    regex: '(?i)(sasl\.jaas\.config|loginmodule).{0,80}?password\s*=\s*"?[^\s"]+'
+
+  - id: infra-oauth-client-secret
+    category: InfraCreds
+    title: OAuth2 client secret
+    severity: CRITICAL
+    keywords: ["client-secret", "client_secret"]
+    regex: '(?i)client[_-]secret\s*[:=]\s*\S+'
+
+  # ---- snmp / dns ------------------------------------------------------------
+  - id: infra-snmp-community
+    category: InfraCreds
+    title: SNMP community string
+    severity: HIGH
+    keywords: ["community"]
+    regex: '(?i)(ro|rw)?community\s+\S+'
+
+  - id: infra-dns-tsig-secret
+    category: InfraCreds
+    title: BIND/TSIG secret
+    severity: HIGH
+    keywords: ["secret"]
+    regex: 'secret\s+"[A-Za-z0-9+/=]{8,}"'
+
+  # ---- hashes ----------------------------------------------------------------
+  - id: infra-hash-crypt
+    category: InfraCreds
+    title: crypt/apr1 password hash
+    severity: MEDIUM
+    keywords: ["$apr1$", "$6$", "$5$", "$1$", "$2"]
+    regex: '\$(apr1|1|5|6|2[aby]?)\$[^\s]+'
+
+  - id: infra-hash-ldap
+    category: InfraCreds
+    title: LDAP/dovecot SSHA hash
+    severity: MEDIUM
+    keywords: ["{SSHA}", "{SHA}"]
+    regex: '(?i)\{s?sha[0-9]*\}[A-Za-z0-9+/=]+'
+
+  # ---- private keys ----------------------------------------------------------
+  - id: infra-pem-private-key
+    category: InfraCreds
+    title: PEM private key header
+    severity: CRITICAL
+    keywords: ["PRIVATE KEY"]
+    regex: '-----BEGIN ([A-Z0-9]+ )?PRIVATE KEY-----'
+
+  # ---- CLI / shell-history idioms -------------------------------------------
+  - id: infra-cli-mysql-p
+    category: InfraCreds
+    title: mysql -p<password> on command line
+    severity: CRITICAL
+    keywords: ["mysql", "mysqldump", "mariadb"]
+    regex: '(?i)(mysql|mysqldump|mariadb)\s[^#]*\s-p[^\s=]+'
+
+  - id: infra-cli-curl-userpass
+    category: InfraCreds
+    title: curl -u user:pass
+    severity: HIGH
+    keywords: ["curl"]
+    regex: 'curl\s.*(-u|--user)\s+\S+'
+
+  - id: infra-cli-redis-auth
+    category: InfraCreds
+    title: redis-cli -a <password>
+    severity: HIGH
+    keywords: ["redis-cli"]
+    regex: 'redis-cli\s.*-a\s+\S+'
+
+  - id: infra-cli-htpasswd-b
+    category: InfraCreds
+    title: htpasswd -b user pass
+    severity: HIGH
+    keywords: ["htpasswd"]
+    regex: 'htpasswd\s.*-b\s+\S+\s+\S+'
+
+  - id: infra-cli-doveadm-pw
+    category: InfraCreds
+    title: doveadm pw -p <plaintext>
+    severity: HIGH
+    keywords: ["doveadm"]
+    regex: 'doveadm\s+pw\s.*-p\s+\S+'
+
+  - id: infra-cli-openssl-pass
+    category: InfraCreds
+    title: openssl pass:<secret>
+    severity: HIGH
+    keywords: ["pass:"]
+    regex: 'pass:\S+'
+
+  # ===========================================================================
+  # Service-specific additions: postgres, nginx, openldap, pgadmin, grafana,
+  # prometheus, jaspersoft, wiremock
+  # ===========================================================================
+
+  # ---- PostgreSQL ------------------------------------------------------------
+  - id: infra-postgres-uri
+    category: InfraCreds
+    title: PostgreSQL URI with embedded password
+    severity: CRITICAL
+    keywords: ["postgres://", "postgresql://"]
+    regex: '(?i)postgres(ql)?://[^/\s:@]+:[^/\s:@]+@\S+'
+
+  - id: infra-postgres-conninfo-pw
+    category: InfraCreds
+    title: libpq conninfo password (password=... near host/dbname)
+    severity: HIGH
+    keywords: ["dbname", "host=", "hostaddr"]
+    regex: '(?i)(password|pwd)\s*=\s*''?[^''\s]+''?\s*(host|hostaddr|dbname|port|user)='
+
+  # ---- nginx -----------------------------------------------------------------
+  - id: infra-nginx-proxy-pass-cred
+    category: InfraCreds
+    title: nginx proxy_pass upstream with embedded creds
+    severity: HIGH
+    keywords: ["proxy_pass"]
+    regex: '(?i)proxy_pass\s+https?://[^/\s:@]+:[^/\s:@]+@'
+
+  # ---- OpenLDAP --------------------------------------------------------------
+  - id: infra-ldap-rootpw
+    category: InfraCreds
+    title: OpenLDAP rootpw / olcRootPW
+    severity: CRITICAL
+    keywords: ["rootpw", "olcRootPW"]
+    regex: '(?i)(olcRootPW|rootpw)\s*:?\s*\S+'
+
+  - id: infra-ldap-bindpw
+    category: InfraCreds
+    title: LDAP bind password (bindpw / bind_password)
+    severity: HIGH
+    keywords: ["bindpw", "bind_password", "bindpassword", "bind-password"]
+    regex: '(?i)(bindpw|bind[_-]?password)\s*[:=]?\s*\S+'
+
+  - id: infra-ldap-cli-w
+    category: InfraCreds
+    title: ldap* -w <password> on command line
+    severity: HIGH
+    keywords: ["ldapsearch", "ldapmodify", "ldapadd", "ldapwhoami", "ldapdelete", "ldappasswd", "ldapcompare"]
+    regex: '(?i)ldap(search|modify|add|delete|whoami|compare|passwd|modrdn)\b.*\s-w\s+\S+'
+
+  # ---- JSON-quoted creds (pgAdmin servers.json, Grafana provisioning, etc.) --
+  - id: infra-json-quoted-secret
+    category: InfraCreds
+    title: JSON key password/secret/token with quoted value
+    severity: HIGH
+    keywords: ["password", "secret", "token", "apikey", "api_key"]
+    regex: '(?i)"(password|passwd|secret|secret_key|token|api[_-]?key|basicAuthPassword)"\s*:\s*"[^"]+"'
+
+  # ---- Grafana ---------------------------------------------------------------
+  - id: infra-grafana-admin-password
+    category: InfraCreds
+    title: Grafana admin password
+    severity: CRITICAL
+    keywords: ["GF_SECURITY_ADMIN_PASSWORD", "admin_password"]
+    regex: '(?i)(GF_SECURITY_ADMIN_PASSWORD|admin_password)\s*[:=]\s*\S+'
+
+  - id: infra-grafana-token
+    category: InfraCreds
+    title: Grafana API key / service-account token
+    severity: CRITICAL
+    keywords: ["glsa_", "glc_", "eyJrIjoi"]
+    regex: '(glsa_[A-Za-z0-9_]{8,}|glc_[A-Za-z0-9_=+/-]{8,}|eyJrIjoi[A-Za-z0-9/+=]+)'
+
+  - id: infra-grafana-datasource-pw
+    category: InfraCreds
+    title: Grafana datasource basicAuthPassword / secureJsonData
+    severity: HIGH
+    keywords: ["basicAuthPassword", "secureJsonData"]
+    regex: '(?i)(basicauthpassword|secureJsonData)[^\n]{0,40}?[:=]\s*\S+'
+
+  # ---- Prometheus ------------------------------------------------------------
+  - id: infra-prometheus-bearer-token
+    category: InfraCreds
+    title: Prometheus bearer_token in scrape config
+    severity: HIGH
+    keywords: ["bearer_token"]
+    regex: '(?i)bearer_token\s*:\s*\S+'
+
+  - id: infra-prometheus-credentials
+    category: InfraCreds
+    title: Prometheus authorization credentials
+    severity: HIGH
+    keywords: ["credentials"]
+    regex: '(?i)credentials\s*:\s*\S+'
+
+  # ---- JasperReports / JasperSoft -------------------------------------------
+  - id: infra-jasper-db-password
+    category: InfraCreds
+    title: JasperReports repository / datasource password
+    severity: HIGH
+    keywords: ["metadata.hibernate", "repository.jdbc", "jdbc.password", "js.password"]
+    regex: '(?i)(metadata\.hibernate\.password|repository\.jdbc\.password|jdbc\.password|js\.password)\s*[:=]\s*\S+'
+
+  # ---- WireMock --------------------------------------------------------------
+  - id: infra-wiremock-keystore-pw
+    category: InfraCreds
+    title: WireMock keystore / key-manager / truststore password
+    severity: HIGH
+    keywords: ["keystore-password", "key-manager-password", "trust-store-password", "truststore-password"]
+    regex: '(?i)(keystore-password|key-manager-password|trust-?store-password)[=:\s]\s*\S+'
+
+  # ===========================================================================
+  # BROAD GENERIC CATCH-ALL (noisier by design — catches the patterns above
+  # regardless of which service/keyword surrounds them). Expect false positives;
+  # delete this block if the report gets too noisy and rely on the specific rules.
+  # ===========================================================================
+  - id: infra-generic-keyname-secret
+    category: InfraCreds
+    title: Any key named *password/secret/token/credential/apikey = value
+    severity: HIGH
+    keywords: ["password", "passwd", "pwd", "passphrase", "secret", "token", "apikey", "api_key", "credential"]
+    regex: '(?i)[a-z0-9_.\-]*(password|passwd|pwd|passphrase|secret|token|api[_-]?key|credential)s?\s*[:=>]+\s*["\x27]?[^\s"\x27]+'
+
+  - id: infra-generic-cli-password-flag
+    category: InfraCreds
+    title: Any --password/--pass/--pw CLI flag with inline value
+    severity: HIGH
+    keywords: ["--password", "--passwd", "--pass", "--pw"]
+    regex: '(?i)(--password|--passwd|--pass|--pw)[=\s]\s*\S+'

@@ -1,146 +1,126 @@
 #!/usr/bin/env bash
 #
-# download-logs-batch.sh
+# scan-logs-trivy.sh
 #
-# Download the last N days of events for a list of CloudWatch log groups, one
-# file per group. Resumable: each group is marked done only on a clean finish,
-# so if temporary credentials expire part-way through you just refresh them and
-# re-run — already-completed groups are skipped, and a half-downloaded group is
-# redone from scratch (never left partial and marked done).
+# Scan a directory of (possibly huge) CloudWatch log files for secrets with
+# Trivy, one file at a time: chunk a log into small line-whole pieces so none
+# trips Trivy's "file too large" skip, scan the chunks, save the result, then
+# delete the chunks before moving to the next log. Disk never holds more than
+# one log's chunks at a time.
 #
-# Pure aws CLI + coreutils. No Python, no jq.
+# Resumable: a log is recorded done only after it scans cleanly, so a re-run
+# skips finished logs (handy if a run is interrupted).
 #
 # USAGE
-#   ./download-logs-batch.sh                 # uses the defaults below
-#   LOG_GROUP_FILE=groups.txt DAYS=31 ./download-logs-batch.sh
+#   ./scan-logs-trivy.sh [LOGDIR]            # defaults to cwlogs
+#   CHUNK_SIZE=10M OUTDIR=results ./scan-logs-trivy.sh cwlogs
 #
-# INPUT
-#   LOG_GROUP_FILE: one log group name per line. Blank lines and #comments
-#   ignored. A line may optionally be "<group><TAB><stream-name-prefix>" to
-#   scope a large group (e.g. /dna/instance-logs) and avoid throttling.
+# If a trivy-secret.yaml exists (or SECRET_CONFIG points to one) it is passed
+# to Trivy so your custom infra-cred rules run alongside the built-ins.
 # -----------------------------------------------------------------------------
-LOG_GROUP_FILE="${LOG_GROUP_FILE:-log_groups.txt}"
-OUTDIR="${OUTDIR:-cwlogs}"
-DAYS="${DAYS:-31}"
-REGION="${REGION:-}"                       # e.g. eu-west-1; blank = CLI default
-DONE_FILE="${DONE_FILE:-$OUTDIR/.download-done.txt}"
-FAILED_FILE="${FAILED_FILE:-$OUTDIR/.download-failed.txt}"
-
-export AWS_RETRY_MODE="${AWS_RETRY_MODE:-adaptive}"
-export AWS_MAX_ATTEMPTS="${AWS_MAX_ATTEMPTS:-10}"
+LOGDIR="${1:-${LOGDIR:-cwlogs}}"
+OUTDIR="${OUTDIR:-trivy-results}"
+CHUNK_SIZE="${CHUNK_SIZE:-5M}"             # whole-line chunks; stays under Trivy's limit
+SECRET_CONFIG="${SECRET_CONFIG:-trivy-secret.yaml}"
+CHUNK_ROOT="${CHUNK_ROOT:-$OUTDIR/.chunks}"
+DONE_FILE="${DONE_FILE:-$OUTDIR/.scanned-done.txt}"
 
 # -----------------------------------------------------------------------------
+command -v trivy >/dev/null 2>&1 || { echo "ERROR: trivy not found on PATH" >&2; exit 1; }
+[ -d "$LOGDIR" ] || { echo "ERROR: log dir not found: $LOGDIR" >&2; exit 1; }
+
 mkdir -p "$OUTDIR"
-touch "$DONE_FILE" "$FAILED_FILE"
+touch "$DONE_FILE"
 
-if [ ! -f "$LOG_GROUP_FILE" ]; then
-  echo "ERROR: log group file not found: $LOG_GROUP_FILE" >&2
-  exit 1
+# use custom rules only if the file is actually there
+CONFIG_ARG=()
+if [ -f "$SECRET_CONFIG" ]; then
+  CONFIG_ARG=(--secret-config "$SECRET_CONFIG")
+  echo "Using custom secret rules: $SECRET_CONFIG"
+else
+  echo "No $SECRET_CONFIG found — built-in rules only (cloud/SaaS tokens; infra creds may be missed)."
+fi
+echo "Log dir: $LOGDIR | chunk size: $CHUNK_SIZE | results: $OUTDIR"
+echo
+
+# always clean up the scratch chunk dir, even on Ctrl-C
+cleanup() { rm -rf "$CHUNK_ROOT"; }
+trap cleanup EXIT
+
+shopt -s nullglob
+logs=("$LOGDIR"/*.log)
+shopt -u nullglob
+if [ "${#logs[@]}" -eq 0 ]; then
+  echo "No *.log files in $LOGDIR" >&2; exit 1
 fi
 
-# GNU date (Linux). On macOS use: date -v-"${DAYS}"d +%s
-START_MS=$(( $(date -d "$DAYS days ago" +%s) * 1000 ))
-NOW_MS=$(( $(date +%s) * 1000 ))
+n_find=0; n_clean=0; n_skip=0; n_err=0
+: > "$OUTDIR/.findings-index.txt"
 
-REGION_ARG=(); [ -n "$REGION" ] && REGION_ARG=(--region "$REGION")
+for f in "${logs[@]}"; do
+  base="$(basename "$f")"
 
-# strings in CLI stderr that mean "your credentials are gone" -> stop, don't
-# churn through every remaining group failing identically.
-EXPIRY_RE='ExpiredToken|ExpiredTokenException|RequestExpired|InvalidClientTokenId|UnrecognizedClientException|security token.*(expired|invalid)|The provided token has expired|credentials.*(expired|not|invalid)'
-
-safe_name() { printf '%s' "$1" | sed 's#[/ ]#_#g; s/\t/__/g'; }
-
-# counters
-n_done=0; n_skip=0; n_fail=0
-
-echo "Batch download: last $DAYS days  (since epoch-ms $START_MS)"
-echo "Groups file : $LOG_GROUP_FILE"
-echo "Output dir  : $OUTDIR"
-echo "Done marker : $DONE_FILE"
-echo
-
-while IFS= read -r line || [ -n "$line" ]; do
-  case "$line" in ''|\#*) continue ;; esac
-  # trim trailing whitespace/CR
-  line="$(printf '%s' "$line" | sed 's/[[:space:]]*$//')"
-  [ -z "$line" ] && continue
-
-  # optional tab-separated stream prefix
-  GROUP="${line%%$'\t'*}"
-  if [ "$GROUP" != "$line" ]; then PREFIX="${line#*$'\t'}"; else PREFIX=""; fi
-
-  SAFE="$(safe_name "$line")"
-  OUTFILE="$OUTDIR/$SAFE.log"
-  PARTFILE="$OUTDIR/$SAFE.partial"
-
-  # ---- resume check: done AND the file is actually present -------------------
-  if grep -Fxq -- "$line" "$DONE_FILE" && [ -f "$OUTFILE" ]; then
-    echo "skip (done): $line"
-    n_skip=$((n_skip+1))
-    continue
+  if grep -Fxq -- "$base" "$DONE_FILE"; then
+    echo "skip (done): $base"; n_skip=$((n_skip+1)); continue
   fi
 
-  echo ">> downloading: $GROUP ${PREFIX:+(prefix: $PREFIX)}"
+  echo "============================================================"
+  echo "LOG: $base  ($(du -h "$f" | cut -f1))"
 
-  PREFIX_ARG=(); [ -n "$PREFIX" ] && PREFIX_ARG=(--log-stream-name-prefix "$PREFIX")
-  ERR="$OUTDIR/.err.$$"
+  # 1) chunk this one log into whole-line pieces
+  chunkdir="$CHUNK_ROOT/$base"
+  rm -rf "$chunkdir"; mkdir -p "$chunkdir"
+  split -C "$CHUNK_SIZE" -d --additional-suffix=.log "$f" "$chunkdir/part." 2>/dev/null \
+    || split -C "$CHUNK_SIZE" -d "$f" "$chunkdir/part."   # fallback if --additional-suffix unsupported
+  echo "  chunks: $(ls -1 "$chunkdir" | wc -l)"
 
-  aws "${REGION_ARG[@]}" logs filter-log-events \
-      --log-group-name "$GROUP" \
-      "${PREFIX_ARG[@]}" \
-      --start-time "$START_MS" \
-      --end-time "$NOW_MS" \
-      --query 'events[].message' \
-      --output text \
-      > "$PARTFILE" 2> "$ERR"
-  rc=$?
-
-  if [ "$rc" -eq 0 ]; then
-    # clean finish -> commit: rename, then record done
-    mv -f "$PARTFILE" "$OUTFILE"
-    printf '%s\n' "$line" >> "$DONE_FILE"
-    # drop any stale failed-entry for this line
-    grep -Fxv -- "$line" "$FAILED_FILE" > "$FAILED_FILE.tmp" 2>/dev/null \
-      && mv -f "$FAILED_FILE.tmp" "$FAILED_FILE"
-    echo "   done: $(wc -l < "$OUTFILE") lines -> $OUTFILE"
-    n_done=$((n_done+1))
-    rm -f "$ERR"
-    continue
+  # 2) scan the chunks -> JSON (authoritative, parseable without jq)
+  json="$OUTDIR/$base.json"
+  if ! trivy fs --scanners secret "${CONFIG_ARG[@]}" \
+        --format json --output "$json" "$chunkdir" 2> "$OUTDIR/.trivy.err"; then
+    echo "  ERROR scanning $base (left chunks in $chunkdir for inspection):" >&2
+    sed 's/^/    /' "$OUTDIR/.trivy.err" | head -n 5 >&2
+    n_err=$((n_err+1))
+    continue   # not marked done -> retried next run
   fi
 
-  # non-zero: is it credential expiry? then stop cleanly so a re-run resumes.
-  rm -f "$PARTFILE"
-  if grep -qiE "$EXPIRY_RE" "$ERR"; then
-    echo >&2
-    echo "=============================================================" >&2
-    echo "CREDENTIALS EXPIRED while on: $line" >&2
-    sed 's/^/   /' "$ERR" | head -n 3 >&2
-    echo "-------------------------------------------------------------" >&2
-    echo "Refresh your temporary credentials and re-run the SAME command." >&2
-    echo "$n_done completed this run are recorded; they will be skipped." >&2
-    echo "=============================================================" >&2
-    rm -f "$ERR"
-    exit 2
+  # 3) human-readable table from the same JSON (no re-scan)
+  txt="$OUTDIR/$base.txt"
+  trivy convert --format table --output "$txt" "$json" 2>/dev/null || cp "$json" "$txt"
+
+  # 4) findings? Trivy JSON puts each secret under a "RuleID"
+  hits=$(grep -c '"RuleID"' "$json" 2>/dev/null)
+  if [ "${hits:-0}" -gt 0 ]; then
+    echo "  >>> FINDINGS: $hits secret match(es)  (see $txt)"
+    printf '%s\t%s hits\n' "$base" "$hits" >> "$OUTDIR/.findings-index.txt"
+    n_find=$((n_find+1))
+  else
+    echo "  clean (no matches)"
+    n_clean=$((n_clean+1))
   fi
 
-  # other error (throttling exhausted, access denied on one group, etc.):
-  # record it and keep going so one bad group doesn't block the rest.
-  echo "   FAILED (rc=$rc): $line  — see below, continuing" >&2
-  sed 's/^/     /' "$ERR" | head -n 3 >&2
-  grep -Fxq -- "$line" "$FAILED_FILE" || printf '%s\n' "$line" >> "$FAILED_FILE"
-  n_fail=$((n_fail+1))
-  rm -f "$ERR"
-done < "$LOG_GROUP_FILE"
+  # 5) record done and free the disk
+  printf '%s\n' "$base" >> "$DONE_FILE"
+  rm -rf "$chunkdir"
+done
+
+rm -f "$OUTDIR/.trivy.err"
 
 echo
 echo "============================================================"
-echo "Run summary"
-echo "  downloaded this run : $n_done"
-echo "  skipped (already done): $n_skip"
-echo "  failed (non-auth)   : $n_fail"
-echo "  total recorded done : $(grep -c . "$DONE_FILE")"
-[ "$n_fail" -gt 0 ] && echo "  failed groups listed in: $FAILED_FILE"
+echo "Summary"
+echo "  logs with findings : $n_find"
+echo "  clean logs         : $n_clean"
+echo "  skipped (done)     : $n_skip"
+echo "  errored            : $n_err"
 echo "============================================================"
+if [ "$n_find" -gt 0 ]; then
+  echo "Logs with secret matches:"
+  sed 's/^/  /' "$OUTDIR/.findings-index.txt"
+  echo "Per-log reports (.txt/.json) are in $OUTDIR/"
+fi
 echo
-echo "Re-run any time: completed groups are skipped automatically."
-[ "$n_fail" -gt 0 ] && echo "Failed (non-auth) groups are NOT marked done, so a re-run retries them."
+echo "Re-run any time: finished logs are skipped. Errored logs are retried."
+echo "NOTE: built-in Trivy rules target cloud/SaaS tokens. For infra creds"
+echo "(sasl_password=, SNMP communities, dovecot hashes, JDBC...) add a"
+echo "trivy-secret.yaml, or also run your own scan-ecs-logs-for-credentials.sh."

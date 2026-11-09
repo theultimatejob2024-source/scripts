@@ -2,153 +2,118 @@
 #
 # triage-trivy-findings.sh
 #
-# Turn a pile of per-log Trivy JSON results into a short, deduped, ranked list
-# of DISTINCT findings so you can tell genuine credential exposure from noise.
+# Default run: for every high-confidence Trivy finding, show the ACTUAL leaked
+# value pulled from the source log — trimmed to just the secret, unmasked,
+# deduped. Pure noise (broad/generic rules) is hidden unless you ask for it.
 #
-# Trivy redacts the secret value (****) in its output, so this tool shows you
-# WHERE and WHICH RULE (deduped, ranked by rule confidence); to see the real
-# value and confirm, use the `reveal` subcommand to grep the source log.
-#
-# Pure Bash + awk/grep/sed. No jq (parses Trivy's pretty-printed JSON directly).
+# Pure Bash + awk/grep/sed (no jq).
 #
 # USAGE
-#   ./triage-trivy-findings.sh [RESULTS_DIR]                 # triage report
-#   ./triage-trivy-findings.sh reveal <source-log> [LOGDIR]  # real lines from source
+#   ./triage-trivy-findings.sh [RESULTS_DIR]        # reveal all real exposures (default)
+#   ./triage-trivy-findings.sh noise [RESULTS_DIR]  # show the skipped noisy bucket
+#   ./triage-trivy-findings.sh reveal <log> [LOGDIR]# just one log's real values
 #
-#   RESULTS_DIR default: trivy-results   (holds <log>.log.json files)
-#   LOGDIR      default: cwlogs          (holds the original <log>.log files)
+#   RESULTS_DIR default: trivy-results   LOGDIR default: cwlogs
 # -----------------------------------------------------------------------------
 RESULTS_DIR="${RESULTS_DIR:-trivy-results}"
 LOGDIR="${LOGDIR:-cwlogs}"
 US=$'\037'
+TRIM="${TRIM:-120}"
+MAX_PER_LOG="${MAX_PER_LOG:-50}"
 
-# Rules that are broad/noisy by design -> findings go to the REVIEW-LATER bucket.
 NOISY_RULES="infra-generic-password infra-generic-secret infra-env-inline-secret infra-generic-keyname-secret infra-generic-cli-password-flag infra-json-quoted-secret infra-prometheus-credentials infra-generic-uri-cred"
-
 is_noisy() { case " $NOISY_RULES " in *" $1 "*) return 0;; esac; return 1; }
 
-# -----------------------------------------------------------------------------
-# Extract findings from Trivy's (pretty-printed) secret JSON into TSV:
-#   SRC \t RuleID \t Severity \t StartLine \t Match
-# Each of RuleID/Severity/StartLine/Match appears once per secret at its own
-# line in pretty JSON, and only at secret level (Code block uses different keys).
-# -----------------------------------------------------------------------------
-extract_one() {   # $1 = json file
+reveal_values() {
+  local f="$1"
+  grep -aoiE '(\{(ssha|smd5|sha|md5|crypt)[0-9]*\}[A-Za-z0-9+/=]+|\$(apr1|[0-9a-z]+)\$[^[:space:]]+|eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|gl(sa|c)_[A-Za-z0-9_=+/-]+|[a-z][a-z0-9+.-]*://[^/[:space:]:@]+:[^/[:space:]:@]+@[^[:space:]]*|(password|passwd|pwd|passphrase|secret|token|rootpw|bindpw|sasl_password|client[_-]secret|api[_-]?key|bearer_token|rocommunity|rwcommunity|community|admin_password|key-?store-?password|basicauthpassword)[[:space:]:=]+[^[:space:]*][^[:space:]]*)' "$f" \
+    | grep -avE '\*{3,}|REDACTED|=\$\{|<[^>]*>' \
+    | sed -E "s/^(.{0,$TRIM}).*\$/\1/" \
+    | sort -u \
+    | head -n "$MAX_PER_LOG"
+}
+
+extract_one() {
   local src; src="$(basename "$1")"; src="${src%.json}"
   awk -v SRC="$src" -v US="$US" '
-    function val(s) {              # pull value after the first colon
-      sub(/^[^:]*:[[:space:]]*/, "", s)
-      sub(/,[[:space:]]*$/, "", s)
-      gsub(/^"|"$/, "", s)
-      gsub(/\\"/, "\"", s)
-      return s
-    }
-    /"RuleID"[[:space:]]*:/ {
-      if (have) { print SRC US rid US sev US line US match_ }   # flush prev
-      rid=val($0); sev=""; line=""; match_=""; have=1; next
-    }
-    /"Severity"[[:space:]]*:/ { if (have) sev=val($0); next }
-    /"StartLine"[[:space:]]*:/ { if (have && line=="") line=val($0); next }
-    /"Match"[[:space:]]*:/ { if (have) match_=val($0); next }
-    END { if (have) print SRC US rid US sev US line US match_ }
+    function val(s){ sub(/^[^:]*:[[:space:]]*/,"",s); if(s ~ /^"/){ sub(/^"/,"",s); sub(/".*$/,"",s) } else { sub(/[^0-9].*$/,"",s) } return s }
+    /"RuleID"[[:space:]]*:/    { if(have) print SRC US rid US sev US line US m; rid=val($0); sev=""; line=""; m=""; have=1; next }
+    /"Severity"[[:space:]]*:/  { if(have) sev=val($0); next }
+    /"StartLine"[[:space:]]*:/ { if(have && line=="") line=val($0); next }
+    /"Match"[[:space:]]*:/     { if(have) m=val($0); next }
+    END { if(have) print SRC US rid US sev US line US m }
   ' "$1"
 }
 
-normalize_match() {   # collapse redaction runs + whitespace so dups fold together
-  sed -E 's/\*{2,}/\*\*\*/g; s/[[:space:]]+/ /g; s/^ //; s/ $//'
-}
-
-# -----------------------------------------------------------------------------
-# Triage report
-# -----------------------------------------------------------------------------
-triage() {
-  [ -d "$RESULTS_DIR" ] || { echo "ERROR: results dir not found: $RESULTS_DIR" >&2; exit 1; }
+gather() {
   shopt -s nullglob; local jsons=("$RESULTS_DIR"/*.json); shopt -u nullglob
-  [ "${#jsons[@]}" -gt 0 ] || { echo "No *.json in $RESULTS_DIR" >&2; exit 1; }
-
-  local ALL; ALL="$(mktemp)"
-  for j in "${jsons[@]}"; do extract_one "$j"; done > "$ALL"
-
-  local total; total=$(grep -c . "$ALL")
-  if [ "$total" -eq 0 ]; then echo "No findings in $RESULTS_DIR."; rm -f "$ALL"; return; fi
-
-  # build deduped records: key = RuleID + normalized Match
-  # emit: count <TAB> RuleID <TAB> Severity <TAB> nsrc <TAB> normMatch <TAB> srcs
-  local DEDUP; DEDUP="$(mktemp)"
-  awk -v US="$US" 'BEGIN{FS=US}
-    {
-      src=$1; rid=$2; sev=$3; m=$5
-      # normalize match
-      gsub(/\*\*+/,"***",m); gsub(/[ \t]+/," ",m); sub(/^ /,"",m); sub(/ $/,"",m)
-      key=rid US m
-      cnt[key]++; sevk[key]=sev; ridk[key]=rid; mk[key]=m
-      if (!((key SUBSEP src) in seen)) { seen[key SUBSEP src]=1; nsrc[key]++; srcs[key]=srcs[key]==""?src:srcs[key]","src }
-    }
-    END{ for (k in cnt) printf "%d%s%s%s%s%s%d%s%s%s%s\n", cnt[k],US,ridk[k],US,sevk[k],US,nsrc[k],US,mk[k],US,srcs[k] }
-  ' "$ALL" > "$DEDUP"
-
-  local n_distinct; n_distinct=$(grep -c . "$DEDUP")
-
-  # severity weight for sorting
-  weight() { case "$1" in CRITICAL) echo 0;; HIGH) echo 1;; MEDIUM) echo 2;; LOW) echo 3;; *) echo 4;; esac; }
-
-  print_bucket() {   # $1 = "review" (specific) or "noise" (generic)
-    local want="$1" row cnt rid sev nsrc m srcs w
-    while IFS="$US" read -r cnt rid sev nsrc m srcs; do
-      if [ "$want" = "noise" ]; then is_noisy "$rid" || continue; else is_noisy "$rid" && continue; fi
-      w=$(weight "$sev")
-      printf '%d%s%06d%s%s%s%s%s%d%s%s%s%s\n' "$w" "$US" "$cnt" "$US" "$sev" "$US" "$rid" "$US" "$nsrc" "$US" "$m" "$US" "$srcs"
-    done < "$DEDUP" | sort -t"$US" -k1,1n -k2,2nr | while IFS="$US" read -r w cnt sev rid nsrc m srcs; do
-      cnt=$((10#$cnt))
-      printf '  [%s] %s  (x%d across %d log%s)\n' "$sev" "$rid" "$cnt" "$nsrc" "$([ "$nsrc" -ne 1 ] && echo s)"
-      printf '      match: %s\n' "$m"
-      printf '      logs : %s\n' "$srcs"
-    done
-  }
-
-  {
-    echo "============================================================"
-    echo "Trivy findings triage"
-    echo "  result files : ${#jsons[@]}   raw findings: $total   distinct: $n_distinct"
-    echo "============================================================"
-    echo
-    echo "### REVIEW THESE — specific rules, higher confidence ###"
-    echo "(distinct findings; validate the value via: $0 reveal <log>)"
-    echo
-    print_bucket review
-    echo
-    echo "### LIKELY NOISE — broad/generic rules, skim only ###"
-    echo
-    print_bucket noise
-    echo
-    echo "### per-rule totals (raw) ###"
-    awk -v US="$US" 'BEGIN{FS=US}{c[$2]++} END{for(k in c) printf "  %6d  %s\n", c[k], k}' "$ALL" | sort -rn
-  }
-
-  rm -f "$ALL" "$DEDUP"
+  [ "${#jsons[@]}" -gt 0 ] || return 1
+  local j; for j in "${jsons[@]}"; do extract_one "$j"; done
 }
 
-# -----------------------------------------------------------------------------
-# reveal: show the REAL (un-redacted) candidate lines from the source log
-# -----------------------------------------------------------------------------
-reveal() {
+triage_reveal() {
+  [ -d "$RESULTS_DIR" ] || { echo "ERROR: results dir not found: $RESULTS_DIR" >&2; exit 1; }
+  local ALL; ALL="$(mktemp)"; gather > "$ALL" || { echo "No *.json in $RESULTS_DIR" >&2; rm -f "$ALL"; exit 1; }
+
+  local REV; REV="$(mktemp)"
+  awk -v US="$US" 'BEGIN{FS=US;OFS=US}{print $1,$2,$3,$5}' "$ALL" > "$REV.tmp"
+  : > "$REV"
+  while IFS="$US" read -r src rid sev m; do is_noisy "$rid" || printf '%s%s%s%s%s%s%s\n' "$src" "$US" "$rid" "$US" "$sev" "$US" "$m" >> "$REV"; done < "$REV.tmp"
+  rm -f "$REV.tmp"
+
+  local n_rev n_noise n_logs
+  n_rev=$(grep -c . "$REV")
+  n_noise=$(awk -v US="$US" 'BEGIN{FS=US}{print $2}' "$ALL" | while read -r r; do is_noisy "$r" && echo x; done | grep -c .)
+  n_logs=$(cut -d"$US" -f1 "$REV" | sort -u | grep -c .)
+
+  echo "============================================================"
+  echo "Leaked credentials — confirmed values from source logs"
+  echo "  source logs with findings: $n_logs   (noise hidden: $n_noise — see '$0 noise')"
+  echo "============================================================"
+
+  if [ "$n_rev" -eq 0 ]; then echo; echo "No high-confidence findings."; rm -f "$ALL" "$REV"; return; fi
+
+  cut -d"$US" -f1 "$REV" | sort -u | while IFS= read -r src; do
+    [ -n "$src" ] || continue
+    echo
+    echo ">>> $src"
+    awk -v US="$US" -v s="$src" 'BEGIN{FS=US}$1==s{print "    - "$3" "$2}' "$REV" | sort -u
+    echo "    leaked:"
+    local f="$LOGDIR/$src"
+    if [ -f "$f" ]; then
+      reveal_values "$f" | sed 's/^/      /'
+    else
+      echo "      (source log not in $LOGDIR — showing Trivy's redacted match instead)"
+      awk -v US="$US" -v s="$src" 'BEGIN{FS=US}$1==s{print "      "$4}' "$REV" | sort -u | sed -E "s/^(.{0,$((TRIM+6))}).*/\1/"
+    fi
+  done
+
+  echo
+  echo "------------------------------------------------------------"
+  echo "Values above are real (unmasked) and deduped. Keep them off chat/tickets."
+  rm -f "$ALL" "$REV"
+}
+
+show_noise() {
+  local ALL; ALL="$(mktemp)"; gather > "$ALL" || { echo "No *.json in $RESULTS_DIR" >&2; rm -f "$ALL"; exit 1; }
+  echo "Noisy (broad-rule) findings — counts per rule, skim only:"
+  awk -v US="$US" 'BEGIN{FS=US}{print $2}' "$ALL" | while read -r r; do is_noisy "$r" && echo "$r"; done \
+    | sort | uniq -c | sort -rn | awk '{printf "  %6d  %s\n",$1,$2}'
+  rm -f "$ALL"
+}
+
+reveal_one() {
   local src="$1" dir="${2:-$LOGDIR}"
   [ -n "$src" ] || { echo "usage: $0 reveal <source-log> [LOGDIR]" >&2; exit 1; }
-  local f="$dir/$src"
-  [ -f "$f" ] || f="$dir/${src%.json}"       # tolerate passing the .json name
+  local f="$dir/$src"; [ -f "$f" ] || f="$dir/${src%.json}"
   [ -f "$f" ] || { echo "ERROR: source log not found: $dir/$src" >&2; exit 1; }
-  echo "Real candidate lines in $f (masked-only lines filtered out):"
-  echo "------------------------------------------------------------"
-  grep -anE '(\{(SSHA|CRYPT|MD5|SHA)[0-9]*\}|\$(apr1|[0-9a-z]+)\$|://[^/ :@]+:[^/ :@]+@|(password|passwd|secret|token|rootpw|bindpw|client[_-]secret)[[:space:]:=]+[^ *[:space:]])' "$f" \
-    | grep -vE '\*{3,}' \
-    | head -n 60
-  echo "------------------------------------------------------------"
-  echo "(showing up to 60; refine with: grep -anE '<pattern>' \"$f\")"
+  echo "Leaked values in $f:"
+  reveal_values "$f" | sed 's/^/  /'
 }
 
-# -----------------------------------------------------------------------------
 case "${1:-}" in
-  reveal) shift; reveal "$@" ;;
-  ""|triage) [ "${1:-}" = "triage" ] && shift; [ -n "${1:-}" ] && RESULTS_DIR="$1"; triage ;;
-  *) RESULTS_DIR="$1"; triage ;;
+  reveal)       shift; reveal_one "$@" ;;
+  noise)        shift; [ -n "${1:-}" ] && RESULTS_DIR="$1"; show_noise ;;
+  ""|triage)    [ "${1:-}" = "triage" ] && shift; [ -n "${1:-}" ] && RESULTS_DIR="$1"; triage_reveal ;;
+  *)            RESULTS_DIR="$1"; triage_reveal ;;
 esac

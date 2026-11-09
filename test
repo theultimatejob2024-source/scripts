@@ -1,111 +1,133 @@
-# trivy-pii.yaml — biometric + biographic PII only.
-# Use: trivy fs --scanners secret --secret-config trivy-pii.yaml <path>
+#!/usr/bin/env bash
+#
+# triage-trivy-findings.sh
+#
+# Default run: for every high-confidence Trivy finding, show the ACTUAL value
+# pulled from the source log — trimmed to just the match, unmasked, deduped.
+# Noise (broad/generic rules) hidden unless asked for.
+#
+#   MODE=cred (default) -> credential value extraction
+#   MODE=pii            -> biometric/biographic PII value extraction
+#
+# Pure Bash + awk/grep/sed (no jq).
+#
+# USAGE
+#   ./triage-trivy-findings.sh [RESULTS_DIR]              # reveal exposures (default)
+#   MODE=pii RESULTS_DIR=pii-results ./triage-trivy-findings.sh
+#   ./triage-trivy-findings.sh noise [RESULTS_DIR]        # show skipped noisy bucket
+#   ./triage-trivy-findings.sh reveal <log> [LOGDIR]      # one log's real values
+#
+#   RESULTS_DIR default: trivy-results   LOGDIR default: cwlogs
+# -----------------------------------------------------------------------------
+RESULTS_DIR="${RESULTS_DIR:-trivy-results}"
+LOGDIR="${LOGDIR:-cwlogs}"
+MODE="${MODE:-cred}"
+US=$'\037'
+TRIM="${TRIM:-120}"
+MAX_PER_LOG="${MAX_PER_LOG:-50}"
 
-allow-rules:
-  - id: example-email-domains
-    regex: '@(example|test|localhost|invalid)\.'
-  - id: placeholder-ssn
-    regex: '(000-00-0000|123-45-6789|111-11-1111)'
+CRED_NOISY="infra-generic-password infra-generic-secret infra-env-inline-secret infra-generic-keyname-secret infra-generic-cli-password-flag infra-json-quoted-secret infra-prometheus-credentials infra-generic-uri-cred"
+PII_NOISY="pii-demographic-field pii-biometric-keyword"
+if [ "$MODE" = "pii" ]; then NOISY_RULES="$PII_NOISY"; else NOISY_RULES="$CRED_NOISY"; fi
+is_noisy() { case " $NOISY_RULES " in *" $1 "*) return 0;; esac; return 1; }
 
-rules:
-  # ---------------- Biometric ----------------
-  - id: pii-biometric-template-value
-    category: BiometricData
-    title: Biometric template/image field with a value
-    severity: HIGH
-    keywords: ["fingerprint", "face", "iris", "retina", "palm", "voice"]
-    regex: '(?i)(fingerprint|face|iris|retina|palm|voice)[_-]?(template|image|encoding|embedding|scan|data|record|sample)\s*[:=]\s*\S+'
+# credential value extractor (tightened)
+CRED_PAT='(\{(ssha|smd5|sha|md5|crypt)[0-9]*\}[A-Za-z0-9+/=]{6,}|\$(apr1|1|5|6|2[abxy]?|y|gy|7|md5|sha256|sha512)\$[^[:space:]]{6,}|eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|gl(sa|c)_[A-Za-z0-9_=+/-]+|[a-z][a-z0-9+.-]*://[^/[:space:]:@]+:[^/[:space:]:@]+@[^[:space:]]*|(password|passwd|pwd|passphrase|secret|rootpw|bindpw|sasl_password|client[_-]secret|api[_-]?key|bearer_token|admin_password|key-?store-?password|basicauthpassword)[[:space:]]*[:=]+[[:space:]]*[^[:space:]]{4,}|(rocommunity|rwcommunity|community)[[:space:]]+[a-z][a-z0-9_-]{3,})'
 
-  - id: pii-biometric-keyword
-    category: BiometricData
-    title: Biometric data reference (voiceprint/palmprint/faceID/minutiae)
-    severity: MEDIUM
-    keywords: ["biometric", "voiceprint", "palmprint", "faceid", "iris scan", "minutiae"]
-    regex: '(?i)(biometrics?|voice[_-]?print|palm[_-]?print|face[_-]?id|iris[_ -]?scan|minutiae)\b'
+# PII value extractor (biometric + biographic), value-focused
+PII_PAT='([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b|\b(4[0-9]{12}([0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(011|5[0-9]{2})[0-9]{12})\b|\b[A-Z]{5}[0-9]{4}[A-Z]\b|\b[2-9][0-9]{3}[[:space:]][0-9]{4}[[:space:]][0-9]{4}\b|\b[A-CEGHJ-PR-TW-Z]{2}[0-9]{6}[A-D]\b|passport[[:space:]]*(no\.?|number|num|#)?[[:space:]]*[:=#]?[[:space:]]*[A-Z0-9]{6,9}|(phone|mobile|msisdn|tel|contact)[[:space:]]*(no|number|#)?[[:space:]]*[:=][[:space:]]*\+?[0-9][0-9[:space:]().-]{7,}|(dob|date[_ ]?of[_ ]?birth|birth[_-]?date)[[:space:]]*[:=][[:space:]]*[^[:space:]]+|(driver.?s?[_ ]?licen[sc]e|driving[_ ]?licen[sc]e|dl[_ ]?(no|number|#))[[:space:]]*[:=#]?[[:space:]]*[A-Z0-9]{5,}|(nationality|gender|marital[_ -]?status|place[_ -]?of[_ -]?birth|mother[_ -]?s?[_ -]?maiden)[[:space:]]*[:=][[:space:]]*[^[:space:]]+|(fingerprint|face|iris|retina|palm|voice)[_-]?(template|image|encoding|embedding|scan|data|record|sample)[[:space:]]*[:=][[:space:]]*[^[:space:]]+|voice[_-]?print|palm[_-]?print|face[_-]?id|iris[_ -]?scan|minutiae|\.wsq\b|ISO[/ ]?19794|NIST[- ]?ITL|CBEFF)'
 
-  - id: pii-biometric-format
-    category: BiometricData
-    title: Biometric format/standard reference (WSQ, ISO 19794, NIST-ITL, CBEFF)
-    severity: MEDIUM
-    keywords: ["wsq", "19794", "NIST-ITL", "NISTITL", "CBEFF"]
-    regex: '(?i)(\.wsq\b|ISO[/ ]?19794|ANSI[/ ]?NIST[- ]?ITL|NIST[- ]?ITL|CBEFF)'
+reveal_values() {
+  local f="$1" pat="$CRED_PAT"
+  [ "$MODE" = "pii" ] && pat="$PII_PAT"
+  grep -aoiE "$pat" "$f" \
+    | grep -avE '\*{3,}|REDACTED|=\$\{|<[^>]*>' \
+    | sed -E "s/^(.{0,$TRIM}).*\$/\1/" \
+    | sort -u \
+    | head -n "$MAX_PER_LOG"
+}
 
-  # ---------------- Biographic ----------------
-  - id: pii-email
-    category: BiographicData
-    title: Email address
-    severity: MEDIUM
-    regex: '[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}'
+extract_one() {
+  local src; src="$(basename "$1")"; src="${src%.json}"
+  awk -v SRC="$src" -v US="$US" '
+    function val(s){ sub(/^[^:]*:[[:space:]]*/,"",s); if(s ~ /^"/){ sub(/^"/,"",s); sub(/".*$/,"",s) } else { sub(/[^0-9].*$/,"",s) } return s }
+    /"RuleID"[[:space:]]*:/    { if(have) print SRC US rid US sev US line US m; rid=val($0); sev=""; line=""; m=""; have=1; next }
+    /"Severity"[[:space:]]*:/  { if(have) sev=val($0); next }
+    /"StartLine"[[:space:]]*:/ { if(have && line=="") line=val($0); next }
+    /"Match"[[:space:]]*:/     { if(have) m=val($0); next }
+    END { if(have) print SRC US rid US sev US line US m }
+  ' "$1"
+}
 
-  - id: pii-us-ssn
-    category: BiographicData
-    title: US Social Security Number
-    severity: HIGH
-    regex: '\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b'
+gather() {
+  shopt -s nullglob; local jsons=("$RESULTS_DIR"/*.json); shopt -u nullglob
+  [ "${#jsons[@]}" -gt 0 ] || return 1
+  local j; for j in "${jsons[@]}"; do extract_one "$j"; done
+}
 
-  - id: pii-credit-card
-    category: BiographicData
-    title: Payment card number (major brands)
-    severity: HIGH
-    regex: '\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b'
+triage_reveal() {
+  [ -d "$RESULTS_DIR" ] || { echo "ERROR: results dir not found: $RESULTS_DIR" >&2; exit 1; }
+  local ALL; ALL="$(mktemp)"; gather > "$ALL" || { echo "No *.json in $RESULTS_DIR" >&2; rm -f "$ALL"; exit 1; }
 
-  - id: pii-india-pan
-    category: BiographicData
-    title: India PAN
-    severity: HIGH
-    regex: '\b[A-Z]{5}[0-9]{4}[A-Z]\b'
+  local REV; REV="$(mktemp)"
+  awk -v US="$US" 'BEGIN{FS=US;OFS=US}{print $1,$2,$3,$5}' "$ALL" > "$REV.tmp"
+  : > "$REV"
+  while IFS="$US" read -r src rid sev m; do is_noisy "$rid" || printf '%s%s%s%s%s%s%s\n' "$src" "$US" "$rid" "$US" "$sev" "$US" "$m" >> "$REV"; done < "$REV.tmp"
+  rm -f "$REV.tmp"
 
-  - id: pii-india-aadhaar-spaced
-    category: BiographicData
-    title: India Aadhaar (spaced 12-digit)
-    severity: HIGH
-    regex: '\b[2-9][0-9]{3}\s[0-9]{4}\s[0-9]{4}\b'
+  local n_rev n_noise n_logs
+  n_rev=$(grep -c . "$REV")
+  n_noise=$(awk -v US="$US" 'BEGIN{FS=US}{print $2}' "$ALL" | while read -r r; do is_noisy "$r" && echo x; done | grep -c .)
+  n_logs=$(cut -d"$US" -f1 "$REV" | sort -u | grep -c .)
 
-  - id: pii-india-aadhaar-labeled
-    category: BiographicData
-    title: India Aadhaar (labeled 12-digit)
-    severity: HIGH
-    keywords: ["aadhaar", "aadhar", "uidai", "uid"]
-    regex: '(?i)(aadha?ar|uidai?|uid)\s*(no|number|#|:|=)?\s*[2-9][0-9]{3}\s?[0-9]{4}\s?[0-9]{4}\b'
+  echo "============================================================"
+  echo "Leaked $([ "$MODE" = pii ] && echo PII || echo credentials) — confirmed values from source logs  [MODE=$MODE]"
+  echo "  source logs with findings: $n_logs   (noise hidden: $n_noise — see '$0 noise')"
+  echo "============================================================"
 
-  - id: pii-uk-nino
-    category: BiographicData
-    title: UK National Insurance Number
-    severity: HIGH
-    keywords: ["NI", "nino", "national insurance"]
-    regex: '\b[A-CEGHJ-PR-TW-Z]{2}[0-9]{6}[A-D]\b'
+  if [ "$n_rev" -eq 0 ]; then echo; echo "No high-confidence findings."; rm -f "$ALL" "$REV"; return; fi
 
-  - id: pii-passport
-    category: BiographicData
-    title: Passport number (labeled)
-    severity: HIGH
-    keywords: ["passport"]
-    regex: '(?i)passport\s*(no\.?|number|num|#)?\s*[:=#]?\s*[A-Z0-9]{6,9}\b'
+  cut -d"$US" -f1 "$REV" | sort -u | while IFS= read -r src; do
+    [ -n "$src" ] || continue
+    echo
+    echo ">>> $src"
+    awk -v US="$US" -v s="$src" 'BEGIN{FS=US}$1==s{print "    - "$3" "$2}' "$REV" | sort -u
+    echo "    found:"
+    local f="$LOGDIR/$src"
+    if [ -f "$f" ]; then
+      reveal_values "$f" | sed 's/^/      /'
+    else
+      echo "      (source log not in $LOGDIR — showing Trivy's redacted match instead)"
+      awk -v US="$US" -v s="$src" 'BEGIN{FS=US}$1==s{print "      "$4}' "$REV" | sort -u | sed -E "s/^(.{0,$((TRIM+6))}).*/\1/"
+    fi
+  done
 
-  - id: pii-phone
-    category: BiographicData
-    title: Phone / mobile number (labeled)
-    severity: MEDIUM
-    keywords: ["phone", "mobile", "msisdn", "tel", "contact"]
-    regex: '(?i)(phone|mobile|msisdn|tel|contact)\s*(no|number|#)?\s*[:=]\s*\+?[0-9][0-9\s\-().]{7,}'
+  echo
+  echo "------------------------------------------------------------"
+  echo "Values above are real (unmasked) and deduped. Keep them off chat/tickets."
+  rm -f "$ALL" "$REV"
+}
 
-  - id: pii-dob
-    category: BiographicData
-    title: Date of birth (labeled)
-    severity: HIGH
-    keywords: ["dob", "birth"]
-    regex: '(?i)(dob|date[_ ]?of[_ ]?birth|birth[_-]?date)\s*[:=]\s*\S+'
+show_noise() {
+  local ALL; ALL="$(mktemp)"; gather > "$ALL" || { echo "No *.json in $RESULTS_DIR" >&2; rm -f "$ALL"; exit 1; }
+  echo "Noisy (broad-rule) findings — counts per rule, skim only:"
+  awk -v US="$US" 'BEGIN{FS=US}{print $2}' "$ALL" | while read -r r; do is_noisy "$r" && echo "$r"; done \
+    | sort | uniq -c | sort -rn | awk '{printf "  %6d  %s\n",$1,$2}'
+  rm -f "$ALL"
+}
 
-  - id: pii-drivers-license
-    category: BiographicData
-    title: Driver's license (labeled)
-    severity: HIGH
-    keywords: ["licence", "license", "driving", "dl no", "dln"]
-    regex: '(?i)(driver\x27?s?[_ ]?licen[sc]e|driving[_ ]?licen[sc]e|dl[_ ]?(no|number|#))\s*[:=#]?\s*[A-Z0-9]{5,}'
+reveal_one() {
+  local src="$1" dir="${2:-$LOGDIR}"
+  [ -n "$src" ] || { echo "usage: $0 reveal <source-log> [LOGDIR]" >&2; exit 1; }
+  local f="$dir/$src"; [ -f "$f" ] || f="$dir/${src%.json}"
+  [ -f "$f" ] || { echo "ERROR: source log not found: $dir/$src" >&2; exit 1; }
+  echo "Found in $f  [MODE=$MODE]:"
+  reveal_values "$f" | sed 's/^/  /'
+}
 
-  - id: pii-demographic-field
-    category: BiographicData
-    title: Demographic field (nationality/gender/marital/POB/maiden name)
-    severity: LOW
-    keywords: ["nationality", "gender", "marital", "place of birth", "maiden"]
-    regex: '(?i)(nationality|gender|marital[_ -]?status|place[_ -]?of[_ -]?birth|mother[_ -]?s?[_ -]?maiden)\s*[:=]\s*\S+'
+case "${1:-}" in
+  reveal)       shift; reveal_one "$@" ;;
+  noise)        shift; [ -n "${1:-}" ] && RESULTS_DIR="$1"; show_noise ;;
+  ""|triage)    [ "${1:-}" = "triage" ] && shift; [ -n "${1:-}" ] && RESULTS_DIR="$1"; triage_reveal ;;
+  *)            RESULTS_DIR="$1"; triage_reveal ;;
+esac

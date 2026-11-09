@@ -1,102 +1,45 @@
-#!/usr/bin/env bash
-#
-# scan-dna-references.sh
-#
-# Search logs for DNA / genetic-data references and report in one pass — no
-# Trivy, no separate triage step. Shows, per log, the distinct matched values
-# (trimmed, deduped, masked lines dropped).
-#
-# Note: raw genetic data normally lives in FILES, not logs — so this finds the
-# REFERENCES that show up as text: genomic file paths, SNP IDs, STR loci,
-# profile/genotype fields, genetic terms, and any raw sequence that leaked.
-#
-# Pure Bash + grep/sed/sort. 
-#
-# USAGE: ./scan-dna-references.sh [LOGDIR] [REPORT_FILE]
-#        LOGDIR default: cwlogs
-# -----------------------------------------------------------------------------
-LOGDIR="${1:-${LOGDIR:-cwlogs}}"
-REPORT_FILE="${2:-${REPORT_FILE:-}}"
-TRIM="${TRIM:-100}"
-MAX_PER_TYPE="${MAX_PER_TYPE:-30}"
+# trivy-dna.yaml — DNA / genetic-data references in logs.
+# Use: trivy fs --scanners secret --secret-config trivy-dna.yaml <path>
+# Raw genetic data normally lives in files, so these match the REFERENCES that
+# appear as text: genomic file paths, SNP IDs, STR loci, profile/genotype
+# fields, genetic terms, and raw sequence.
 
-[ -d "$LOGDIR" ] || { echo "ERROR: log dir not found: $LOGDIR" >&2; exit 1; }
+rules:
+  - id: pii-dna-genomic-file
+    category: GeneticData
+    title: Genomic data file reference (VCF/BAM/CRAM/FASTQ/SAM/BCF)
+    severity: HIGH
+    keywords: ["vcf", "bam", "cram", "fastq", ".fq", ".sam", ".bcf"]
+    regex: '(?i)[A-Za-z0-9_./-]*\.(vcf|gvcf|bcf|fastq|fq|bam|cram|sam)(\.gz)?\b'
 
-# TYPES[i] <-> REGEXES[i]. Matched case-insensitively with grep -aoiE.
-TYPES=(
-  GENOMIC_FILE
-  SNP_ID
-  STR_LOCUS
-  GENETIC_FIELD
-  GENETIC_TERM
-  DNA_SEQUENCE
-)
-REGEXES=(
-  '[[:alnum:]_./-]*\.(vcf|gvcf|bcf|fastq|fq|bam|cram|sam)(\.gz)?\b'
-  '\brs[0-9]{3,}\b'
-  '\b(d[0-9]{1,2}s[0-9]{2,4}|vwa|fga|th01|csf1po|tpox|se33|amelogenin|amel)\b'
-  '((dna|str)[_-]?profile|genotype|alleles?)[[:space:]]*[:=][[:space:]]*[^[:space:]]+'
-  '\b(genomic|genome|codis|biosample|dna[_-]?sequence)\b'
-  '\b[acgtn]{20,}\b'
-)
+  - id: pii-dna-snp-id
+    category: GeneticData
+    title: dbSNP variant identifier (rsID)
+    severity: MEDIUM
+    regex: '\brs[0-9]{3,}\b'
 
-emit() { if [ -n "$REPORT_FILE" ]; then tee -a "$REPORT_FILE"; else cat; fi; }
-[ -n "$REPORT_FILE" ] && : > "$REPORT_FILE"
+  - id: pii-dna-str-locus
+    category: GeneticData
+    title: Forensic STR / CODIS locus name
+    severity: HIGH
+    regex: '(?i)\b(D[0-9]{1,2}S[0-9]{2,4}|vWA|FGA|TH01|CSF1PO|TPOX|SE33|amelogenin)\b'
 
-shopt -s nullglob
-logs=("$LOGDIR"/*.log)
-shopt -u nullglob
-[ "${#logs[@]}" -gt 0 ] || { echo "No *.log files in $LOGDIR" >&2; exit 1; }
+  - id: pii-dna-genetic-field
+    category: GeneticData
+    title: Genetic profile / genotype / allele field with a value
+    severity: HIGH
+    keywords: ["genotype", "allele", "dna_profile", "dna-profile", "str_profile", "str-profile"]
+    regex: '(?i)((dna|str)[_-]?profile|genotype|alleles?)\s*[:=]\s*\S+'
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-declare -A TYPE_TOTAL
-logs_with_hits=0
+  - id: pii-dna-genetic-term
+    category: GeneticData
+    title: Genetic / forensic genomics term
+    severity: MEDIUM
+    keywords: ["genomic", "genome", "codis", "biosample", "dna_sequence", "dna-sequence"]
+    regex: '(?i)\b(genomic|genome|codis|biosample|dna[_-]?sequence)\b'
 
-{
-  echo "============================================================"
-  echo "DNA / genetic-data reference scan"
-  echo "  log dir: $LOGDIR"
-  echo "============================================================"
-} | emit
-
-for f in "${logs[@]}"; do
-  base="$(basename "$f")"
-  blockfile="$TMP/block"; : > "$blockfile"
-  any=0
-  for i in "${!TYPES[@]}"; do
-    vals="$(grep -aoiE -e "${REGEXES[$i]}" "$f" 2>/dev/null \
-            | grep -avE '\*{3,}|REDACTED' \
-            | sed -E "s/^(.{0,$TRIM}).*$/\1/" \
-            | sort -u | head -n "$MAX_PER_TYPE")"
-    [ -n "$vals" ] || continue
-    any=1
-    local_count=$(printf '%s\n' "$vals" | grep -c .)
-    TYPE_TOTAL[${TYPES[$i]}]=$(( ${TYPE_TOTAL[${TYPES[$i]}]:-0} + local_count ))
-    {
-      printf '    %s (x%d):\n' "${TYPES[$i]}" "$local_count"
-      printf '%s\n' "$vals" | sed 's/^/        /'
-    } >> "$blockfile"
-  done
-  if [ "$any" -eq 1 ]; then
-    logs_with_hits=$((logs_with_hits+1))
-    { echo; echo ">>> $base"; cat "$blockfile"; } | emit
-  fi
-done
-
-{
-  echo
-  echo "------------------------------------------------------------"
-  echo "Summary"
-  if [ "$logs_with_hits" -eq 0 ]; then
-    echo "  No DNA / genetic-data references found."
-  else
-    echo "  logs with DNA references: $logs_with_hits"
-    echo "  distinct matches per type:"
-    for t in "${TYPES[@]}"; do
-      [ -n "${TYPE_TOTAL[$t]:-}" ] && printf '    %-14s %s\n' "$t" "${TYPE_TOTAL[$t]}"
-    done
-  fi
-  echo "------------------------------------------------------------"
-  echo "Note: these are references in text. Confirm each against the source log;"
-  echo "an ID-shaped value may be a record ID rather than genetic data."
-} | emit
+  - id: pii-dna-sequence
+    category: GeneticData
+    title: Raw DNA sequence (20+ bases)
+    severity: HIGH
+    regex: '(?i)\b[acgtn]{20,}\b'

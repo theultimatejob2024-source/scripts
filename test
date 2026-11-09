@@ -1,525 +1,102 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Log Review — Credentials &amp; PII</title>
-<style>
-  body{max-width:820px;margin:40px auto;padding:0 22px;color:#1a1a1a;
-    font:16px/1.55 Georgia,"Times New Roman",serif}
-  h1{font-size:23px;margin:0 0 4px}
-  h2{font-size:18px;margin:28px 0 8px;border-bottom:1px solid #999;padding-bottom:3px}
-  p{margin:9px 0}
-  ul{margin:8px 0;padding-left:22px}
-  li{margin:3px 0}
-  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:14.5px}
-  th,td{border:1px solid #999;padding:6px 9px;text-align:left;vertical-align:top}
-  th{background:#eee}
-  code{font-family:Consolas,Menlo,monospace;font-size:13px;background:#f3f3f3;padding:0 3px}
-  .date{color:#555;font-size:14px;margin-bottom:20px}
-  pre.yaml{background:#f6f6f6;border:1px solid #bbb;padding:11px 13px;overflow-x:auto;
-    font:12px/1.5 Consolas,Menlo,monospace;white-space:pre;color:#222;margin:10px 0;
-    border-radius:3px}
-</style>
-</head>
-<body>
-
-<h1>Log Review — Credentials &amp; PII</h1>
-<div class="date">Internal note · November 2026</div>
-
-<p>
-  This note records the log review I carried out to find credentials and personal
-  data that had been written into our logs. Logs were pulled from CloudWatch and
-  searched for anything sensitive, so that exposed secrets could be rotated and any
-  exposed personal data cleaned up at source.
-</p>
-
-<h2>Scope</h2>
-<p>In scope:</p>
-<ul>
-  <li>CloudWatch log groups for the in-scope ECS clusters and infrastructure hosts.</li>
-  <li>The last 31 days of events per log group.</li>
-  <li>Spring Boot / Java applications and infrastructure services — PostgreSQL, nginx,
-      Squid, Postfix, Dovecot, OpenLDAP, ActiveMQ, Grafana, Prometheus, pgAdmin,
-      JasperReports and WireMock.</li>
-  <li>Shell command history where it appears in those logs.</li>
-</ul>
-<p>Not in scope: live systems and configuration files that are not shipped to
-  CloudWatch, and anything outside the listed log groups and 31-day window.</p>
-
-<h2>Credentials searched for</h2>
-<table>
-  <thead><tr><th>Category</th><th>What it covers</th><th>Example keywords</th><th>Severity</th></tr></thead>
-  <tbody>
-    <tr><td>Generic password / secret</td><td>Passwords and secrets assigned a value</td><td><code>password=</code>, <code>secret=</code>, <code>passphrase</code></td><td>High</td></tr>
-    <tr><td>Inline env secret</td><td>Secrets set as environment variables</td><td><code>PGPASSWORD=</code>, <code>MYSQL_PWD=</code>, <code>*_PASSWORD=</code>, <code>*_TOKEN=</code></td><td>High</td></tr>
-    <tr><td>Mail (SASL)</td><td>Postfix / Dovecot auth and SMTP AUTH blobs</td><td><code>sasl_password=</code>, <code>AUTH PLAIN</code>, <code>AUTH LOGIN</code></td><td>Critical</td></tr>
-    <tr><td>Proxy / HTTP auth</td><td>Squid and HTTP basic / bearer headers</td><td><code>Proxy-Authorization</code>, <code>Authorization: Basic</code>, <code>Bearer</code></td><td>High</td></tr>
-    <tr><td>URL / JDBC credentials</td><td>Credentials inside a connection string</td><td><code>scheme://user:pass@</code>, <code>jdbc:…?password=</code></td><td>Critical</td></tr>
-    <tr><td>Spring Boot / Java</td><td>Framework config and JVM secrets</td><td><code>spring.datasource.password</code>, <code>-Djavax.net.ssl.*Password</code>, <code>client-secret</code></td><td>Critical</td></tr>
-    <tr><td>Password hashes</td><td>Hashes written to logs</td><td><code>$apr1$</code>, <code>$6$</code>, <code>{SSHA}</code></td><td>Medium</td></tr>
-    <tr><td>OpenLDAP</td><td>Directory root / bind credentials</td><td><code>rootpw</code>, <code>olcRootPW</code>, <code>bindpw</code></td><td>Critical</td></tr>
-    <tr><td>SNMP</td><td>Community strings</td><td><code>community</code>, <code>rocommunity</code></td><td>High</td></tr>
-    <tr><td>Private keys</td><td>PEM private key material</td><td><code>-----BEGIN … PRIVATE KEY-----</code></td><td>Critical</td></tr>
-    <tr><td>CLI / shell history</td><td>Secrets passed on the command line</td><td><code>mysql -p…</code>, <code>curl -u user:pass</code>, <code>redis-cli -a</code></td><td>High</td></tr>
-    <tr><td>App services</td><td>Service-specific secrets</td><td>Grafana <code>admin_password</code> / tokens, Prometheus <code>bearer_token</code>, pgAdmin / WireMock passwords</td><td>High</td></tr>
-  </tbody>
-</table>
-
-<h2>Personal data searched for</h2>
-<table>
-  <thead><tr><th>Type</th><th>What it covers</th><th>Example</th></tr></thead>
-  <tbody>
-    <tr><td>Biometric references</td><td>Mentions of biometric handling</td><td><code>voiceprint</code>, <code>palmprint</code>, <code>faceID</code>, <code>minutiae</code></td></tr>
-    <tr><td>Format / standard markers</td><td>Biometric interchange formats</td><td><code>.wsq</code>, <code>ISO 19794</code>, <code>NIST-ITL</code>, <code>CBEFF</code></td></tr>
-    <tr><td>Email address</td><td>Personal / user email addresses</td><td><code>name@domain.tld</code></td></tr>
-    <tr><td>Date of birth</td><td>DOB values (labelled)</td><td><code>dob=</code>, <code>date_of_birth:</code></td></tr>
-  </tbody>
-</table>
-
-<h2>What the patterns mean</h2>
-<p>Each category is a keyword plus a regular expression matching the value's shape. A few of the main ones:</p>
-<ul>
-  <li><b>Inline environment secrets</b> — secrets set as an env variable on a logged command line: <code>PGPASSWORD=</code>, <code>MYSQL_PWD=</code>, <code>*_PASSWORD=</code>, <code>*_TOKEN=</code>.</li>
-  <li><b>Generic key/value secrets</b> — any secret-named field with a value: <code>password</code>, <code>secret</code>, <code>token</code> followed by <code>:</code> or <code>=</code>.</li>
-  <li><b>Embedded-credential URLs</b> — <code>scheme://user:pass@host</code> and JDBC URLs carrying a password.</li>
-  <li><b>Password hashes</b> — <code>$apr1$</code>, <code>$6$</code> (crypt) and <code>{SSHA}</code> (LDAP / Dovecot).</li>
-  <li><b>Shell-history credentials</b> — secrets given as command arguments: <code>mysql -p</code>, <code>curl -u</code>, <code>redis-cli -a</code>.</li>
-  <li><b>Biometric / biographic</b> — biometric field references and formats, email addresses, and labelled date-of-birth fields.</li>
-</ul>
-
-<h2>How the search was done</h2>
-<table>
-  <thead><tr><th>Step</th><th>Detail</th></tr></thead>
-  <tbody>
-    <tr><td>Collect</td><td>31 days of events downloaded per log group from CloudWatch with the AWS CLI.</td></tr>
-    <tr><td>Chunk</td><td>Large logs split into smaller pieces so nothing is skipped for size.</td></tr>
-    <tr><td>Scan</td><td>Each piece scanned with Trivy against the credential and PII pattern sets.</td></tr>
-    <tr><td>Triage</td><td>Findings deduplicated and ranked; low-signal noise set aside.</td></tr>
-    <tr><td>Validate</td><td>Each real finding read back from the source log to confirm it is a genuine exposure before rotation.</td></tr>
-  </tbody>
-</table>
-
-<p>
-  The scanning was done with <b>Trivy</b>, an open-source scanner from Aqua Security used for
-  vulnerability, misconfiguration and secret scanning. Its secret scanner matches file content against
-  rules, each a keyword plus a regular expression. Trivy's built-in rules target cloud / SaaS tokens, so
-  for our infrastructure and application secrets I supplied custom rule sets.
-</p>
-
-<table>
-  <thead><tr><th>Component</th><th>Purpose</th></tr></thead>
-  <tbody>
-    <tr><td>Trivy secret scanner</td><td>Matches log content against the rules (<code>trivy fs --scanners secret</code>).</td></tr>
-    <tr><td>Custom credential rules</td><td>Define the credential categories above, passed with <code>--secret-config</code>.</td></tr>
-    <tr><td>Custom PII rules</td><td>Define the biometric and biographic categories, run as a separate pass.</td></tr>
-    <tr><td>Collection &amp; chunking</td><td>AWS CLI downloader plus splitting of oversized logs.</td></tr>
-    <tr><td>Triage / reveal</td><td>Aggregates results, removes duplicates, and shows the real value of each confirmed finding.</td></tr>
-  </tbody>
-</table>
-
-
-<h2>Credential rules used (trivy-secret.yaml)</h2>
-<pre class="yaml"><code># trivy-secret.yaml
-# Custom Trivy secret-scanning rules ported from scan-ecs-logs-for-credentials.sh
-# so Trivy catches the INFRA-service and Spring Boot/Java credentials that its
-# built-in rules (tuned for cloud/SaaS tokens) do not.
+#!/usr/bin/env bash
 #
-# Use:  trivy fs --scanners secret --secret-config trivy-secret.yaml &lt;path&gt;
-# (scan-logs-trivy.sh picks this file up automatically if it&#x27;s in the CWD.)
+# scan-dna-references.sh
 #
-# These ADD to Trivy&#x27;s built-in rules; they don&#x27;t replace them.
-# Each rule needs &gt;=1 keyword: Trivy only runs the regex on a file when a
-# keyword is present, which keeps scanning fast. Regex is Go/RE2 syntax.
+# Search logs for DNA / genetic-data references and report in one pass — no
+# Trivy, no separate triage step. Shows, per log, the distinct matched values
+# (trimmed, deduped, masked lines dropped).
+#
+# Note: raw genetic data normally lives in FILES, not logs — so this finds the
+# REFERENCES that show up as text: genomic file paths, SNP IDs, STR loci,
+# profile/genotype fields, genetic terms, and any raw sequence that leaked.
+#
+# Pure Bash + grep/sed/sort. 
+#
+# USAGE: ./scan-dna-references.sh [LOGDIR] [REPORT_FILE]
+#        LOGDIR default: cwlogs
+# -----------------------------------------------------------------------------
+LOGDIR="${1:-${LOGDIR:-cwlogs}}"
+REPORT_FILE="${2:-${REPORT_FILE:-}}"
+TRIM="${TRIM:-100}"
+MAX_PER_TYPE="${MAX_PER_TYPE:-30}"
 
-rules:
-  # ---- generic ---------------------------------------------------------------
-  - id: infra-generic-password
-    category: InfraCreds
-    title: Generic password assignment
-    severity: HIGH
-    keywords: [&quot;password&quot;, &quot;passwd&quot;, &quot;passphrase&quot;]
-    regex: &#x27;(?i)(password|passwd|pwd|passphrase)\s*[:=]\s*\S+&#x27;
+[ -d "$LOGDIR" ] || { echo "ERROR: log dir not found: $LOGDIR" >&2; exit 1; }
 
-  - id: infra-generic-secret
-    category: InfraCreds
-    title: Generic secret / client secret
-    severity: HIGH
-    keywords: [&quot;secret&quot;]
-    regex: &#x27;(?i)(client[_-]?secret|api[_-]?secret|secret)\s*[:=]\s*\S+&#x27;
+# TYPES[i] <-> REGEXES[i]. Matched case-insensitively with grep -aoiE.
+TYPES=(
+  GENOMIC_FILE
+  SNP_ID
+  STR_LOCUS
+  GENETIC_FIELD
+  GENETIC_TERM
+  DNA_SEQUENCE
+)
+REGEXES=(
+  '[[:alnum:]_./-]*\.(vcf|gvcf|bcf|fastq|fq|bam|cram|sam)(\.gz)?\b'
+  '\brs[0-9]{3,}\b'
+  '\b(d[0-9]{1,2}s[0-9]{2,4}|vwa|fga|th01|csf1po|tpox|se33|amelogenin|amel)\b'
+  '((dna|str)[_-]?profile|genotype|alleles?)[[:space:]]*[:=][[:space:]]*[^[:space:]]+'
+  '\b(genomic|genome|codis|biosample|dna[_-]?sequence)\b'
+  '\b[acgtn]{20,}\b'
+)
 
-  - id: infra-env-inline-secret
-    category: InfraCreds
-    title: Inline env secret (PASSWORD/SECRET/TOKEN=)
-    severity: HIGH
-    keywords: [&quot;PASSWORD&quot;, &quot;SECRET&quot;, &quot;TOKEN&quot;, &quot;PGPASSWORD&quot;, &quot;MYSQL_PWD&quot;]
-    regex: &#x27;(?i)[a-z0-9_]*(password|secret|token)=\S+&#x27;
+emit() { if [ -n "$REPORT_FILE" ]; then tee -a "$REPORT_FILE"; else cat; fi; }
+[ -n "$REPORT_FILE" ] && : > "$REPORT_FILE"
 
-  # ---- mail (postfix / dovecot) ---------------------------------------------
-  - id: infra-mail-sasl
-    category: InfraCreds
-    title: SASL username/password
-    severity: CRITICAL
-    keywords: [&quot;sasl_&quot;]
-    regex: &#x27;(?i)sasl_(username|password)\s*=\s*\S+&#x27;
+shopt -s nullglob
+logs=("$LOGDIR"/*.log)
+shopt -u nullglob
+[ "${#logs[@]}" -gt 0 ] || { echo "No *.log files in $LOGDIR" >&2; exit 1; }
 
-  - id: infra-smtp-auth-blob
-    category: InfraCreds
-    title: SMTP AUTH PLAIN/LOGIN base64 blob
-    severity: HIGH
-    keywords: [&quot;AUTH PLAIN&quot;, &quot;AUTH LOGIN&quot;]
-    regex: &#x27;AUTH (PLAIN|LOGIN)\s+[A-Za-z0-9+/=]{8,}&#x27;
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+declare -A TYPE_TOTAL
+logs_with_hits=0
 
-  # ---- proxy / http ----------------------------------------------------------
-  - id: infra-squid-proxy-auth
-    category: InfraCreds
-    title: Proxy authorization
-    severity: HIGH
-    keywords: [&quot;Proxy-Authorization&quot;, &quot;proxy_auth&quot;]
-    regex: &#x27;(?i)(proxy-authorization|proxy_auth)\s*[:=]\s*\S+&#x27;
+{
+  echo "============================================================"
+  echo "DNA / genetic-data reference scan"
+  echo "  log dir: $LOGDIR"
+  echo "============================================================"
+} | emit
 
-  - id: infra-http-basic-auth
-    category: InfraCreds
-    title: HTTP Basic auth header
-    severity: HIGH
-    keywords: [&quot;Basic&quot;]
-    regex: &#x27;(?i)authorization:\s*basic\s+[A-Za-z0-9+/=]+&#x27;
+for f in "${logs[@]}"; do
+  base="$(basename "$f")"
+  blockfile="$TMP/block"; : > "$blockfile"
+  any=0
+  for i in "${!TYPES[@]}"; do
+    vals="$(grep -aoiE -e "${REGEXES[$i]}" "$f" 2>/dev/null \
+            | grep -avE '\*{3,}|REDACTED' \
+            | sed -E "s/^(.{0,$TRIM}).*$/\1/" \
+            | sort -u | head -n "$MAX_PER_TYPE")"
+    [ -n "$vals" ] || continue
+    any=1
+    local_count=$(printf '%s\n' "$vals" | grep -c .)
+    TYPE_TOTAL[${TYPES[$i]}]=$(( ${TYPE_TOTAL[${TYPES[$i]}]:-0} + local_count ))
+    {
+      printf '    %s (x%d):\n' "${TYPES[$i]}" "$local_count"
+      printf '%s\n' "$vals" | sed 's/^/        /'
+    } >> "$blockfile"
+  done
+  if [ "$any" -eq 1 ]; then
+    logs_with_hits=$((logs_with_hits+1))
+    { echo; echo ">>> $base"; cat "$blockfile"; } | emit
+  fi
+done
 
-  - id: infra-bearer-token
-    category: InfraCreds
-    title: Bearer token
-    severity: HIGH
-    keywords: [&quot;Bearer&quot;]
-    regex: &#x27;(?i)authorization:\s*bearer\s+[A-Za-z0-9._-]+&#x27;
-
-  - id: infra-jwt
-    category: InfraCreds
-    title: JWT (check exp)
-    severity: MEDIUM
-    keywords: [&quot;eyJ&quot;]
-    regex: &#x27;eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+&#x27;
-
-  - id: infra-url-embedded-cred
-    category: InfraCreds
-    title: URL with embedded user:pass
-    severity: CRITICAL
-    keywords: [&quot;://&quot;]
-    regex: &#x27;[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:[^/\s:@]+@&#x27;
-
-  # ---- Spring Boot / Java ----------------------------------------------------
-  - id: infra-spring-datasource-pw
-    category: InfraCreds
-    title: Spring datasource password
-    severity: CRITICAL
-    keywords: [&quot;datasource.password&quot;, &quot;SPRING_DATASOURCE_PASSWORD&quot;]
-    regex: &#x27;(?i)(spring\.datasource\.password|spring_datasource_password)\s*[:=]\s*\S+&#x27;
-
-  - id: infra-spring-prop-secret
-    category: InfraCreds
-    title: Spring property password/secret
-    severity: HIGH
-    keywords: [&quot;spring.&quot;]
-    regex: &#x27;(?i)spring\.[a-z0-9._-]*(password|secret)\s*[:=]\s*\S+&#x27;
-
-  - id: infra-jdbc-url-query-cred
-    category: InfraCreds
-    title: JDBC URL with password/user in query
-    severity: CRITICAL
-    keywords: [&quot;jdbc:&quot;]
-    regex: &#x27;(?i)jdbc:[a-z0-9]+://\S*(password|passwd|user)=[^\s&amp;&quot;;]+&#x27;
-
-  - id: infra-jdbc-url-userinfo
-    category: InfraCreds
-    title: JDBC URL with user:pass@ userinfo
-    severity: CRITICAL
-    keywords: [&quot;jdbc:&quot;]
-    regex: &#x27;(?i)jdbc:[a-z0-9]+://[^/\s:@]+:[^/\s:@]+@&#x27;
-
-  - id: infra-keystore-password
-    category: InfraCreds
-    title: Java keystore/truststore password
-    severity: HIGH
-    keywords: [&quot;storePassword&quot;, &quot;store-password&quot;]
-    regex: &#x27;(?i)(keystorepassword|truststorepassword|key-store-password|trust-store-password)\s*[:=]\s*\S+&#x27;
-
-  - id: infra-java-ssl-dprop
-    category: InfraCreds
-    title: JVM -Djavax.net.ssl keystore/truststore password
-    severity: HIGH
-    keywords: [&quot;javax.net.ssl&quot;]
-    regex: &#x27;(?i)-Djavax\.net\.ssl\.(keyStore|trustStore)Password=\S+&#x27;
-
-  - id: infra-jvm-dprop-secret
-    category: InfraCreds
-    title: JVM -D system property secret
-    severity: HIGH
-    keywords: [&quot;-D&quot;]
-    regex: &#x27;(?i)-D[a-z0-9._]*(password|passwd|pwd|secret|token)=\S+&#x27;
-
-  - id: infra-kafka-jaas-pw
-    category: InfraCreds
-    title: Kafka SASL JAAS config password
-    severity: CRITICAL
-    keywords: [&quot;jaas.config&quot;, &quot;LoginModule&quot;]
-    regex: &#x27;(?i)(sasl\.jaas\.config|loginmodule).{0,80}?password\s*=\s*&quot;?[^\s&quot;]+&#x27;
-
-  - id: infra-oauth-client-secret
-    category: InfraCreds
-    title: OAuth2 client secret
-    severity: CRITICAL
-    keywords: [&quot;client-secret&quot;, &quot;client_secret&quot;]
-    regex: &#x27;(?i)client[_-]secret\s*[:=]\s*\S+&#x27;
-
-  # ---- snmp / dns ------------------------------------------------------------
-  - id: infra-snmp-community
-    category: InfraCreds
-    title: SNMP community string
-    severity: HIGH
-    keywords: [&quot;community&quot;]
-    regex: &#x27;(?i)(ro|rw)?community\s+\S+&#x27;
-
-  - id: infra-dns-tsig-secret
-    category: InfraCreds
-    title: BIND/TSIG secret
-    severity: HIGH
-    keywords: [&quot;secret&quot;]
-    regex: &#x27;secret\s+&quot;[A-Za-z0-9+/=]{8,}&quot;&#x27;
-
-  # ---- hashes ----------------------------------------------------------------
-  - id: infra-hash-crypt
-    category: InfraCreds
-    title: crypt/apr1 password hash
-    severity: MEDIUM
-    keywords: [&quot;$apr1$&quot;, &quot;$6$&quot;, &quot;$5$&quot;, &quot;$1$&quot;, &quot;$2&quot;]
-    regex: &#x27;\$(apr1|1|5|6|2[aby]?)\$[^\s]+&#x27;
-
-  - id: infra-hash-ldap
-    category: InfraCreds
-    title: LDAP/dovecot SSHA hash
-    severity: MEDIUM
-    keywords: [&quot;{SSHA}&quot;, &quot;{SHA}&quot;]
-    regex: &#x27;(?i)\{s?sha[0-9]*\}[A-Za-z0-9+/=]+&#x27;
-
-  # ---- private keys ----------------------------------------------------------
-  - id: infra-pem-private-key
-    category: InfraCreds
-    title: PEM private key header
-    severity: CRITICAL
-    keywords: [&quot;PRIVATE KEY&quot;]
-    regex: &#x27;-----BEGIN ([A-Z0-9]+ )?PRIVATE KEY-----&#x27;
-
-  # ---- CLI / shell-history idioms -------------------------------------------
-  - id: infra-cli-mysql-p
-    category: InfraCreds
-    title: mysql -p&lt;password&gt; on command line
-    severity: CRITICAL
-    keywords: [&quot;mysql&quot;, &quot;mysqldump&quot;, &quot;mariadb&quot;]
-    regex: &#x27;(?i)(mysql|mysqldump|mariadb)\s[^#]*\s-p[^\s=]+&#x27;
-
-  - id: infra-cli-curl-userpass
-    category: InfraCreds
-    title: curl -u user:pass
-    severity: HIGH
-    keywords: [&quot;curl&quot;]
-    regex: &#x27;curl\s.*(-u|--user)\s+\S+&#x27;
-
-  - id: infra-cli-redis-auth
-    category: InfraCreds
-    title: redis-cli -a &lt;password&gt;
-    severity: HIGH
-    keywords: [&quot;redis-cli&quot;]
-    regex: &#x27;redis-cli\s.*-a\s+\S+&#x27;
-
-  - id: infra-cli-htpasswd-b
-    category: InfraCreds
-    title: htpasswd -b user pass
-    severity: HIGH
-    keywords: [&quot;htpasswd&quot;]
-    regex: &#x27;htpasswd\s.*-b\s+\S+\s+\S+&#x27;
-
-  - id: infra-cli-doveadm-pw
-    category: InfraCreds
-    title: doveadm pw -p &lt;plaintext&gt;
-    severity: HIGH
-    keywords: [&quot;doveadm&quot;]
-    regex: &#x27;doveadm\s+pw\s.*-p\s+\S+&#x27;
-
-  - id: infra-cli-openssl-pass
-    category: InfraCreds
-    title: openssl pass:&lt;secret&gt;
-    severity: HIGH
-    keywords: [&quot;pass:&quot;]
-    regex: &#x27;pass:\S+&#x27;
-
-  # ===========================================================================
-  # Service-specific additions: postgres, nginx, openldap, pgadmin, grafana,
-  # prometheus, jaspersoft, wiremock
-  # ===========================================================================
-
-  # ---- PostgreSQL ------------------------------------------------------------
-  - id: infra-postgres-uri
-    category: InfraCreds
-    title: PostgreSQL URI with embedded password
-    severity: CRITICAL
-    keywords: [&quot;postgres://&quot;, &quot;postgresql://&quot;]
-    regex: &#x27;(?i)postgres(ql)?://[^/\s:@]+:[^/\s:@]+@\S+&#x27;
-
-  - id: infra-postgres-conninfo-pw
-    category: InfraCreds
-    title: libpq conninfo password (password=... near host/dbname)
-    severity: HIGH
-    keywords: [&quot;dbname&quot;, &quot;host=&quot;, &quot;hostaddr&quot;]
-    regex: &#x27;(?i)(password|pwd)\s*=\s*&#x27;&#x27;?[^&#x27;&#x27;\s]+&#x27;&#x27;?\s*(host|hostaddr|dbname|port|user)=&#x27;
-
-  # ---- nginx -----------------------------------------------------------------
-  - id: infra-nginx-proxy-pass-cred
-    category: InfraCreds
-    title: nginx proxy_pass upstream with embedded creds
-    severity: HIGH
-    keywords: [&quot;proxy_pass&quot;]
-    regex: &#x27;(?i)proxy_pass\s+https?://[^/\s:@]+:[^/\s:@]+@&#x27;
-
-  # ---- OpenLDAP --------------------------------------------------------------
-  - id: infra-ldap-rootpw
-    category: InfraCreds
-    title: OpenLDAP rootpw / olcRootPW
-    severity: CRITICAL
-    keywords: [&quot;rootpw&quot;, &quot;olcRootPW&quot;]
-    # require an actual value (hash / crypt / quoted / base64), so slapd MOD
-    # logs that only NAME the attr=olcRootPW (value masked) don&#x27;t false-positive
-    regex: &#x27;(?i)(olcrootpw|rootpw)\s*[:=]{0,2}\s*(\{(crypt|s?sha[0-9]*|s?md5|clear|plain|pbkdf2[a-z0-9]*)\}[^\s]+|\$[0-9a-z]+\$[^\s]+|&quot;[^&quot;]{4,}&quot;|[A-Za-z0-9+/]{12,}={0,2})&#x27;
-
-  - id: infra-ldap-bindpw
-    category: InfraCreds
-    title: LDAP bind password (bindpw / bind_password)
-    severity: HIGH
-    keywords: [&quot;bindpw&quot;, &quot;bind_password&quot;, &quot;bindpassword&quot;, &quot;bind-password&quot;]
-    # value must be non-space AND non-asterisk, so masked &quot;bindpw ****&quot; and
-    # bare attribute-name mentions don&#x27;t false-positive
-    regex: &#x27;(?i)(bindpw|bind[_-]?password)\s*[:=]?\s*[^\s*]{3,}&#x27;
-
-  - id: infra-ldap-cli-w
-    category: InfraCreds
-    title: ldap* -w &lt;password&gt; on command line
-    severity: HIGH
-    keywords: [&quot;ldapsearch&quot;, &quot;ldapmodify&quot;, &quot;ldapadd&quot;, &quot;ldapwhoami&quot;, &quot;ldapdelete&quot;, &quot;ldappasswd&quot;, &quot;ldapcompare&quot;]
-    regex: &#x27;(?i)ldap(search|modify|add|delete|whoami|compare|passwd|modrdn)\b.*\s-w\s+\S+&#x27;
-
-  # ---- JSON-quoted creds (pgAdmin servers.json, Grafana provisioning, etc.) --
-  - id: infra-json-quoted-secret
-    category: InfraCreds
-    title: JSON key password/secret/token with quoted value
-    severity: HIGH
-    keywords: [&quot;password&quot;, &quot;secret&quot;, &quot;token&quot;, &quot;apikey&quot;, &quot;api_key&quot;]
-    regex: &#x27;(?i)&quot;(password|passwd|secret|secret_key|token|api[_-]?key|basicAuthPassword)&quot;\s*:\s*&quot;[^&quot;]+&quot;&#x27;
-
-  # ---- Grafana ---------------------------------------------------------------
-  - id: infra-grafana-admin-password
-    category: InfraCreds
-    title: Grafana admin password
-    severity: CRITICAL
-    keywords: [&quot;GF_SECURITY_ADMIN_PASSWORD&quot;, &quot;admin_password&quot;]
-    regex: &#x27;(?i)(GF_SECURITY_ADMIN_PASSWORD|admin_password)\s*[:=]\s*\S+&#x27;
-
-  - id: infra-grafana-token
-    category: InfraCreds
-    title: Grafana API key / service-account token
-    severity: CRITICAL
-    keywords: [&quot;glsa_&quot;, &quot;glc_&quot;, &quot;eyJrIjoi&quot;]
-    regex: &#x27;(glsa_[A-Za-z0-9_]{8,}|glc_[A-Za-z0-9_=+/-]{8,}|eyJrIjoi[A-Za-z0-9/+=]+)&#x27;
-
-  - id: infra-grafana-datasource-pw
-    category: InfraCreds
-    title: Grafana datasource basicAuthPassword / secureJsonData
-    severity: HIGH
-    keywords: [&quot;basicAuthPassword&quot;, &quot;secureJsonData&quot;]
-    regex: &#x27;(?i)(basicauthpassword|secureJsonData)[^\n]{0,40}?[:=]\s*\S+&#x27;
-
-  # ---- Prometheus ------------------------------------------------------------
-  - id: infra-prometheus-bearer-token
-    category: InfraCreds
-    title: Prometheus bearer_token in scrape config
-    severity: HIGH
-    keywords: [&quot;bearer_token&quot;]
-    regex: &#x27;(?i)bearer_token\s*:\s*\S+&#x27;
-
-  - id: infra-prometheus-credentials
-    category: InfraCreds
-    title: Prometheus authorization credentials
-    severity: HIGH
-    keywords: [&quot;credentials&quot;]
-    regex: &#x27;(?i)credentials\s*:\s*\S+&#x27;
-
-  # ---- JasperReports / JasperSoft -------------------------------------------
-  - id: infra-jasper-db-password
-    category: InfraCreds
-    title: JasperReports repository / datasource password
-    severity: HIGH
-    keywords: [&quot;metadata.hibernate&quot;, &quot;repository.jdbc&quot;, &quot;jdbc.password&quot;, &quot;js.password&quot;]
-    regex: &#x27;(?i)(metadata\.hibernate\.password|repository\.jdbc\.password|jdbc\.password|js\.password)\s*[:=]\s*\S+&#x27;
-
-  # ---- WireMock --------------------------------------------------------------
-  - id: infra-wiremock-keystore-pw
-    category: InfraCreds
-    title: WireMock keystore / key-manager / truststore password
-    severity: HIGH
-    keywords: [&quot;keystore-password&quot;, &quot;key-manager-password&quot;, &quot;trust-store-password&quot;, &quot;truststore-password&quot;]
-    regex: &#x27;(?i)(keystore-password|key-manager-password|trust-?store-password)[=:\s]\s*\S+&#x27;
-
-  # ===========================================================================
-  # BROAD GENERIC CATCH-ALL (noisier by design — catches the patterns above
-  # regardless of which service/keyword surrounds them). Expect false positives;
-  # delete this block if the report gets too noisy and rely on the specific rules.
-  # ===========================================================================
-  - id: infra-generic-keyname-secret
-    category: InfraCreds
-    title: Any key named *password/secret/token/credential/apikey = value
-    severity: HIGH
-    keywords: [&quot;password&quot;, &quot;passwd&quot;, &quot;pwd&quot;, &quot;passphrase&quot;, &quot;secret&quot;, &quot;token&quot;, &quot;apikey&quot;, &quot;api_key&quot;, &quot;credential&quot;]
-    regex: &#x27;(?i)[a-z0-9_.\-]*(password|passwd|pwd|passphrase|secret|token|api[_-]?key|credential)s?\s*[:=&gt;]+\s*[&quot;\x27]?[^\s&quot;\x27]+&#x27;
-
-  - id: infra-generic-cli-password-flag
-    category: InfraCreds
-    title: Any --password/--pass/--pw CLI flag with inline value
-    severity: HIGH
-    keywords: [&quot;--password&quot;, &quot;--passwd&quot;, &quot;--pass&quot;, &quot;--pw&quot;]
-    regex: &#x27;(?i)(--password|--passwd|--pass|--pw)[=\s]\s*\S+&#x27;</code></pre>
-
-<h2>PII rules used (trivy-pii.yaml)</h2>
-<pre class="yaml"><code># trivy-pii.yaml — biometric + biographic PII.
-# Use: trivy fs --scanners secret --secret-config trivy-pii.yaml &lt;path&gt;
-
-allow-rules:
-  - id: example-email-domains
-    regex: &#x27;@(example|test|localhost|invalid)\.&#x27;
-
-rules:
-  - id: pii-biometric-keyword
-    category: BiometricData
-    title: Biometric data reference (voiceprint/palmprint/faceID/minutiae)
-    severity: MEDIUM
-    keywords: [&quot;biometric&quot;, &quot;voiceprint&quot;, &quot;palmprint&quot;, &quot;faceid&quot;, &quot;iris scan&quot;, &quot;minutiae&quot;]
-    regex: &#x27;(?i)(biometrics?|voice[_-]?print|palm[_-]?print|face[_-]?id|iris[_ -]?scan|minutiae)\b&#x27;
-
-  - id: pii-biometric-format
-    category: BiometricData
-    title: Biometric format/standard reference (WSQ, ISO 19794, NIST-ITL, CBEFF)
-    severity: MEDIUM
-    keywords: [&quot;wsq&quot;, &quot;19794&quot;, &quot;NIST-ITL&quot;, &quot;NISTITL&quot;, &quot;CBEFF&quot;]
-    regex: &#x27;(?i)(\.wsq\b|ISO[/ ]?19794|ANSI[/ ]?NIST[- ]?ITL|NIST[- ]?ITL|CBEFF)&#x27;
-
-  - id: pii-email
-    category: BiographicData
-    title: Email address
-    severity: MEDIUM
-    regex: &#x27;[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}&#x27;
-
-  - id: pii-dob
-    category: BiographicData
-    title: Date of birth (labeled)
-    severity: HIGH
-    keywords: [&quot;dob&quot;, &quot;birth&quot;]
-    regex: &#x27;(?i)(dob|date[_ ]?of[_ ]?birth|birth[_-]?date)\s*[:=]\s*\S+&#x27;</code></pre>
-
-</body>
-</html>
+{
+  echo
+  echo "------------------------------------------------------------"
+  echo "Summary"
+  if [ "$logs_with_hits" -eq 0 ]; then
+    echo "  No DNA / genetic-data references found."
+  else
+    echo "  logs with DNA references: $logs_with_hits"
+    echo "  distinct matches per type:"
+    for t in "${TYPES[@]}"; do
+      [ -n "${TYPE_TOTAL[$t]:-}" ] && printf '    %-14s %s\n' "$t" "${TYPE_TOTAL[$t]}"
+    done
+  fi
+  echo "------------------------------------------------------------"
+  echo "Note: these are references in text. Confirm each against the source log;"
+  echo "an ID-shaped value may be a record ID rather than genetic data."
+} | emit

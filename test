@@ -26,7 +26,13 @@ is_noisy() { case " $NOISY_RULES " in *" $1 "*) return 0;; esac; return 1; }
 
 reveal_values() {
   local f="$1"
-  grep -aoiE '(\{(ssha|smd5|sha|md5|crypt)[0-9]*\}[A-Za-z0-9+/=]+|\$(apr1|[0-9a-z]+)\$[^[:space:]]+|eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|gl(sa|c)_[A-Za-z0-9_=+/-]+|[a-z][a-z0-9+.-]*://[^/[:space:]:@]+:[^/[:space:]:@]+@[^[:space:]]*|(password|passwd|pwd|passphrase|secret|token|rootpw|bindpw|sasl_password|client[_-]secret|api[_-]?key|bearer_token|rocommunity|rwcommunity|community|admin_password|key-?store-?password|basicauthpassword)[[:space:]:=]+[^[:space:]*][^[:space:]]*)' "$f" \
+  # value must look like a real secret:
+  #  - a recognised hash form ({SSHA}.., $6$.., restricted crypt IDs) OR
+  #  - a token/URI/JWT OR
+  #  - a password/secret KEY followed by an actual : or = separator and a value
+  #    (so slapd "Password gidNumber" / "RootPW modifying" attribute-name
+  #    mentions and Java "$doGetBean$0(...)" stack frames are NOT matched)
+  grep -aoiE '(\{(ssha|smd5|sha|md5|crypt)[0-9]*\}[A-Za-z0-9+/=]{6,}|\$(apr1|1|5|6|2[abxy]?|y|gy|7|md5|sha256|sha512)\$[^[:space:]]{6,}|eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|gl(sa|c)_[A-Za-z0-9_=+/-]+|[a-z][a-z0-9+.-]*://[^/[:space:]:@]+:[^/[:space:]:@]+@[^[:space:]]*|(password|passwd|pwd|passphrase|secret|rootpw|bindpw|sasl_password|client[_-]secret|api[_-]?key|bearer_token|admin_password|key-?store-?password|basicauthpassword)[[:space:]]*[:=]+[[:space:]]*[^[:space:]]{4,}|(rocommunity|rwcommunity|community)[[:space:]]+[a-z][a-z0-9_-]{3,})' "$f" \
     | grep -avE '\*{3,}|REDACTED|=\$\{|<[^>]*>' \
     | sed -E "s/^(.{0,$TRIM}).*\$/\1/" \
     | sort -u \

@@ -1,18 +1,24 @@
 ALB_ARN="<YOUR_ALB_ARN>"
+ALB_DIM=$(echo "$ALB_ARN" | sed 's#.*:loadbalancer/##')
 START="2026-11-16T18:10:00Z"
 END="2026-11-16T19:10:00Z"
 
-for tg in $(aws elbv2 describe-target-groups --load-balancer-arn "$ALB_ARN" \
-              --query 'TargetGroups[].TargetGroupArn' --output text); do
-  tgdim=${tg##*:}
-  line="$tgdim"
-  for metric in RequestCount TargetConnectionErrorCount HTTPCode_Target_5XX_Count; do
-    val=$(aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
-      --metric-name "$metric" \
-      --dimensions Name=LoadBalancer,Value="$ALB_DIM" Name=TargetGroup,Value="$tgdim" \
-      --start-time "$START" --end-time "$END" --period 3600 --statistics Sum \
-      --query 'Datapoints[0].Sum' --output text)
-    line="$line  $metric=$val"
+if [[ -z "$ALB_DIM" || "$ALB_DIM" == "$ALB_ARN" ]]; then
+  echo "ALB_ARN looks wrong - paste the full ARN"
+else
+  echo "Using: $ALB_DIM"
+  for tg in $(aws elbv2 describe-target-groups --load-balancer-arn "$ALB_ARN" \
+                --query 'TargetGroups[].TargetGroupArn' --output text); do
+    tgdim=${tg##*:}
+    line="$tgdim"
+    for metric in RequestCount TargetConnectionErrorCount HTTPCode_Target_5XX_Count; do
+      val=$(aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
+        --metric-name "$metric" \
+        --dimensions Name=LoadBalancer,Value="$ALB_DIM" Name=TargetGroup,Value="$tgdim" \
+        --start-time "$START" --end-time "$END" --period 3600 --statistics Sum \
+        --query 'Datapoints[0].Sum' --output text)
+      line="$line  $metric=$val"
+    done
+    echo "$line"
   done
-  echo "$line"
-done
+fi

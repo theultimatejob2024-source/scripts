@@ -1,23 +1,18 @@
-TG_DIM=$(echo "<PNC_STUB_TARGET_GROUP_ARN>" | sed 's#.*:##')
-echo "$TG_DIM"     # should print targetgroup/<name>/<id>
+ALB_ARN="<YOUR_ALB_ARN>"
+START="2026-11-16T18:10:00Z"
+END="2026-11-16T19:10:00Z"
 
-START="2026-11-16T14:30:00Z"
-END="2026-11-16T20:00:00Z"
-
-for metric in RequestCount HTTPCode_Target_5XX_Count TargetConnectionErrorCount; do
-  echo "== pnc-stub: $metric (Sum) =="
-  aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
-    --metric-name "$metric" \
-    --dimensions Name=LoadBalancer,Value="$ALB_DIM" Name=TargetGroup,Value="$TG_DIM" \
-    --start-time "$START" --end-time "$END" --period 300 --statistics Sum \
-    --query 'sort_by(Datapoints,&Timestamp)[].[Timestamp,Sum]' --output table
-done
-
-for metric in HealthyHostCount UnHealthyHostCount; do
-  echo "== pnc-stub: $metric (Maximum) =="
-  aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
-    --metric-name "$metric" \
-    --dimensions Name=LoadBalancer,Value="$ALB_DIM" Name=TargetGroup,Value="$TG_DIM" \
-    --start-time "$START" --end-time "$END" --period 300 --statistics Maximum \
-    --query 'sort_by(Datapoints,&Timestamp)[].[Timestamp,Maximum]' --output table
+for tg in $(aws elbv2 describe-target-groups --load-balancer-arn "$ALB_ARN" \
+              --query 'TargetGroups[].TargetGroupArn' --output text); do
+  tgdim=${tg##*:}
+  line="$tgdim"
+  for metric in RequestCount TargetConnectionErrorCount HTTPCode_Target_5XX_Count; do
+    val=$(aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
+      --metric-name "$metric" \
+      --dimensions Name=LoadBalancer,Value="$ALB_DIM" Name=TargetGroup,Value="$tgdim" \
+      --start-time "$START" --end-time "$END" --period 3600 --statistics Sum \
+      --query 'Datapoints[0].Sum' --output text)
+    line="$line  $metric=$val"
+  done
+  echo "$line"
 done

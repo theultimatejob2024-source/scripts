@@ -1,59 +1,125 @@
 #!/usr/bin/env bash
-# redact.sh - make a redacted copy of a file before sharing it.
-# Usage: ./redact.sh <input-file> [output-file]
-# The original file is never changed.
+#
+# restart_ecs_service.sh
+#
+# Restarts one or more ECS services, waits until they are all up and running
+# again, and writes the result to a log file. If the services don't come back,
+# it tries again, up to MAX_ATTEMPTS times, then logs a FAILURE.
+#
+# Same approach as the load balancer health check script: assume the IAM role,
+# wait with a time limit, record each result, exit 0 (pass) or 1 (fail).
 
 set -euo pipefail
 
-if [[ $# -lt 1 || ! -f "$1" ]]; then
-  echo "Usage: $0 <input-file> [output-file]" >&2
-  exit 1
+## Settings - replace the placeholder before use
+AWS_ROLE_ARN='<REDACTED_ROLE_ARN>'
+AWS_SESSION_NAME="jenkins-ecs-service-restart"
+AWS_REGION="eu-west-2"
+MAX_ATTEMPTS=3
+
+#Parameters
+if [[ $# -lt 3 ]]; then
+    echo "Usage: $0 <cluster> <log_file> <service1> [service2 ...]"
+    echo "Eg: $0 <cluster> ecs_restart.log <service_a> <service_b>"
+    exit 1
+fi
+cluster=$1
+log_file=$2
+shift 2
+services=("$@")
+
+## Functions
+
+# Timestamped line to the console (Jenkins log) and to the log file
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "${log_file}"
+}
+
+assume_role() {
+    echo "Assuming role: ${AWS_ROLE_ARN}" >&2
+    local creds expiry
+    creds=$(aws sts assume-role \
+        --role-arn "${AWS_ROLE_ARN}" \
+        --role-session-name "${AWS_SESSION_NAME}" \
+        --duration-seconds 3600 \
+        --output text \
+        --query '[Credentials.AccessKeyId,Credentials.SecretAccessKey,Credentials.SessionToken,Credentials.Expiration]') || return 1
+
+    read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN expiry <<< "${creds}"
+    export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+    export AWS_DEFAULT_REGION="${AWS_REGION}"
+    echo "Token expires at: ${expiry}" >&2
+}
+
+# 1. Restart = force a new deployment. ECS starts new tasks and then stops
+#    the old ones, so the service stays available during the restart.
+restart_services() {
+    local service
+    for service in "${services[@]}"; do
+        log "Restarting ${service} in cluster ${cluster}..."
+        if ! aws ecs update-service --cluster "${cluster}" --service "${service}" \
+                --force-new-deployment --query 'service.serviceName' --output text >/dev/null; then
+            log "ERROR: restart request failed for ${service}"
+            return 1
+        fi
+    done
+}
+
+# 2. Check every service is up: ACTIVE, at least one task wanted, running
+#    count equals desired count, and the old deployment is gone.
+#    Compares exact numbers (no grep), so it can't falsely pass.
+all_running() {
+    local service status desired running deployments result=0
+    for service in "${services[@]}"; do
+        read -r status desired running deployments <<< "$(aws ecs describe-services \
+            --cluster "${cluster}" --services "${service}" \
+            --query 'services[0].[status, desiredCount, runningCount, length(deployments)]' \
+            --output text)"
+        log "${service}: status=${status} desired=${desired} running=${running} deployments=${deployments}"
+        if [[ "${status}" != "ACTIVE" || "${desired}" == "0" || \
+              "${running}" != "${desired}" || "${deployments}" != "1" ]]; then
+            result=1
+        fi
+    done
+    return "${result}"
+}
+
+########
+# Main
+#########
+
+if [[ "${AWS_ROLE_ARN}" == *"<REDACTED"* ]]; then
+    echo "ERROR: fill in AWS_ROLE_ARN in the Settings section first."
+    exit 1
 fi
 
-in="$1"
-if [[ -n "${2:-}" ]]; then
-  out="$2"
-elif [[ "$(basename "$in")" == *.* ]]; then
-  out="${in%.*}.redacted.${in##*.}"
-else
-  out="${in}.redacted"
+log "===== ECS restart started: cluster=${cluster} services=${services[*]} ====="
+
+if ! assume_role; then
+    log "FAILURE: could not assume the AWS role."
+    exit 1
 fi
 
-command -v perl >/dev/null || { echo "perl is required" >&2; exit 1; }
+for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
+    log "Attempt ${attempt}/${MAX_ATTEMPTS}"
 
-perl -0777 -pe '
-  # Private keys and certificates (whole block)
-  s/-----BEGIN [A-Z ]*-----.*?-----END [A-Z ]*-----/<REDACTED_KEY_BLOCK>/gs;
-  # AWS access key IDs
-  s/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/<REDACTED_AWS_KEY>/g;
-  # user:password inside URLs
-  s{(://)[^/\s:@"\x27]+:[^/\s@"\x27]+@}{$1<REDACTED_CREDS>@}g;
-  # Bearer tokens
-  s/(Bearer\s+)[A-Za-z0-9._~+\/=-]+/$1<REDACTED>/gi;
-  # Quoted values given to secret-looking names, e.g. token: "abc", password = "abc"
-  s/(\b\w*(?:password|passwd|pwd|secret|token|api_?key|private_?key)\w*["\x27]?\s*[:=]\s*)(["\x27])[^"\x27\n]*\2/$1$2<REDACTED>$2/gi;
-  # Secret-looking query string values, e.g. ?token=abc
-  s/([?&](?:token|key|secret|password|sig|signature)\w*=)[^&\s"\x27]+/$1<REDACTED>/gi;
-  # AWS ARNs
-  s/arn:aws[\w-]*:[^\s"\x27,)]*/<REDACTED_ARN>/g;
-  # S3 paths
-  s{s3://[^\s"\x27]+}{<REDACTED_S3>}g;
-  # URLs
-  s{https?://[^\s"\x27<>)]+}{<REDACTED_URL>}g;
-  # Internal hostnames
-  s/\b[\w.-]+\.(?:local|internal|gov\.uk)\b/<REDACTED_HOST>/gi;
-  # Email addresses
-  s/\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b/<REDACTED_EMAIL>/g;
-  # IP addresses
-  s/\b(?:\d{1,3}\.){3}\d{1,3}\b/<REDACTED_IP>/g;
-  # 12-digit AWS account IDs
-  s/\b\d{12}\b/<REDACTED_ACCOUNT_ID>/g;
-  # Long random-looking strings (32+ characters)
-  s/\b[A-Za-z0-9+_=-]{32,}\b/<REDACTED_LONG_STRING>/g;
-' "$in" > "$out"
+    if restart_services; then
+        # 3. Wait until all services are stable. Built-in AWS CLI waiter:
+        #    checks every 15s and gives up after about 10 minutes.
+        log "Waiting for services to become available..."
+        aws ecs wait services-stable --cluster "${cluster}" --services "${services[@]}" \
+            || log "Services did not become stable within the wait time."
 
-changed=$(diff "$in" "$out" | grep -c '^>' || true)
-echo "Redacted copy written to: $out ($changed lines changed)"
-echo
-echo "Lines still worth a manual look (names, usernames, anything missed):"
-grep -niE 'password|passwd|secret|token|key|auth|user|@' "$out" | grep -v '<REDACTED' || echo "  none found"
+        # 4. Confirm and log the final state
+        if all_running; then
+            log "SUCCESS: all services are up and running (attempt ${attempt})."
+            exit 0
+        fi
+    fi
+
+    log "Attempt ${attempt} failed."
+done
+
+# 6. Still not back after all attempts
+log "FAILURE: services not up and running after ${MAX_ATTEMPTS} attempts."
+exit 1

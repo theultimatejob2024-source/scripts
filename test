@@ -1,125 +1,27 @@
-#!/usr/bin/env bash
-#
-# restart_ecs_service.sh
-#
-# Restarts one or more ECS services, waits until they are all up and running
-# again, and writes the result to a log file. If the services don't come back,
-# it tries again, up to MAX_ATTEMPTS times, then logs a FAILURE.
-#
-# Same approach as the load balancer health check script: assume the IAM role,
-# wait with a time limit, record each result, exit 0 (pass) or 1 (fail).
+TASKS=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" --query 'taskArns' --output text)
 
-set -euo pipefail
+aws ecs describe-tasks --cluster "$CLUSTER" --tasks $TASKS \
+  --query 'tasks[].{id:taskArn,started:startedAt,status:lastStatus,health:healthStatus,az:availabilityZone,ip:attachments[0].details[?name==`privateIPv4Address`].value|[0],taskDef:taskDefinitionArn}' \
+  --output table
 
-## Settings - replace the placeholder before use
-AWS_ROLE_ARN='<REDACTED_ROLE_ARN>'
-AWS_SESSION_NAME="jenkins-ecs-service-restart"
-AWS_REGION="eu-west-2"
-MAX_ATTEMPTS=3
+aws elbv2 describe-target-health --target-group-arn "<TARGET_GROUP_ARN>" --output table
 
-#Parameters
-if [[ $# -lt 3 ]]; then
-    echo "Usage: $0 <cluster> <log_file> <service1> [service2 ...]"
-    echo "Eg: $0 <cluster> ecs_restart.log <service_a> <service_b>"
-    exit 1
-fi
-cluster=$1
-log_file=$2
-shift 2
-services=("$@")
 
-## Functions
+aws elbv2 describe-target-groups --target-group-arns "<TARGET_GROUP_ARN>" \
+  --query 'TargetGroups[0].{protocol:Protocol,port:Port,hcPath:HealthCheckPath,hcPort:HealthCheckPort,interval:HealthCheckIntervalSeconds,timeout:HealthCheckTimeoutSeconds,healthyThreshold:HealthyThresholdCount,unhealthyThreshold:UnhealthyThresholdCount,matcher:Matcher.HttpCode}'
 
-# Timestamped line to the console (Jenkins log) and to the log file
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "${log_file}"
-}
 
-assume_role() {
-    echo "Assuming role: ${AWS_ROLE_ARN}" >&2
-    local creds expiry
-    creds=$(aws sts assume-role \
-        --role-arn "${AWS_ROLE_ARN}" \
-        --role-session-name "${AWS_SESSION_NAME}" \
-        --duration-seconds 3600 \
-        --output text \
-        --query '[Credentials.AccessKeyId,Credentials.SecretAccessKey,Credentials.SessionToken,Credentials.Expiration]') || return 1
+aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
+  --metric-name HTTPCode_Target_5XX_Count \
+  --dimensions Name=LoadBalancer,Value=app/<alb-name>/<alb-id> \
+  --start-time <START, e.g. 2026-11-16T09:00:00Z> --end-time <END> \
+  --period 300 --statistics Sum --output table
 
-    read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN expiry <<< "${creds}"
-    export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-    export AWS_DEFAULT_REGION="${AWS_REGION}"
-    echo "Token expires at: ${expiry}" >&2
-}
+aws elbv2 describe-load-balancer-attributes --load-balancer-arn "<ALB_ARN>" \
+  --query "Attributes[?starts_with(Key,'access_logs')]"
 
-# 1. Restart = force a new deployment. ECS starts new tasks and then stops
-#    the old ones, so the service stays available during the restart.
-restart_services() {
-    local service
-    for service in "${services[@]}"; do
-        log "Restarting ${service} in cluster ${cluster}..."
-        if ! aws ecs update-service --cluster "${cluster}" --service "${service}" \
-                --force-new-deployment --query 'service.serviceName' --output text >/dev/null; then
-            log "ERROR: restart request failed for ${service}"
-            return 1
-        fi
-    done
-}
+aws ecs describe-task-definition --task-definition "<TASK_DEF_ARN from step 1>" \
+  --query 'taskDefinition.containerDefinitions[].{name:name,logConfig:logConfiguration}'
 
-# 2. Check every service is up: ACTIVE, at least one task wanted, running
-#    count equals desired count, and the old deployment is gone.
-#    Compares exact numbers (no grep), so it can't falsely pass.
-all_running() {
-    local service status desired running deployments result=0
-    for service in "${services[@]}"; do
-        read -r status desired running deployments <<< "$(aws ecs describe-services \
-            --cluster "${cluster}" --services "${service}" \
-            --query 'services[0].[status, desiredCount, runningCount, length(deployments)]' \
-            --output text)"
-        log "${service}: status=${status} desired=${desired} running=${running} deployments=${deployments}"
-        if [[ "${status}" != "ACTIVE" || "${desired}" == "0" || \
-              "${running}" != "${desired}" || "${deployments}" != "1" ]]; then
-            result=1
-        fi
-    done
-    return "${result}"
-}
+aws logs tail "<LOG_GROUP>" --log-stream-name-prefix "<stream-prefix>/<container-name>/<BAD_TASK_ID>" --since 1h
 
-########
-# Main
-#########
-
-if [[ "${AWS_ROLE_ARN}" == *"<REDACTED"* ]]; then
-    echo "ERROR: fill in AWS_ROLE_ARN in the Settings section first."
-    exit 1
-fi
-
-log "===== ECS restart started: cluster=${cluster} services=${services[*]} ====="
-
-if ! assume_role; then
-    log "FAILURE: could not assume the AWS role."
-    exit 1
-fi
-
-for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
-    log "Attempt ${attempt}/${MAX_ATTEMPTS}"
-
-    if restart_services; then
-        # 3. Wait until all services are stable. Built-in AWS CLI waiter:
-        #    checks every 15s and gives up after about 10 minutes.
-        log "Waiting for services to become available..."
-        aws ecs wait services-stable --cluster "${cluster}" --services "${services[@]}" \
-            || log "Services did not become stable within the wait time."
-
-        # 4. Confirm and log the final state
-        if all_running; then
-            log "SUCCESS: all services are up and running (attempt ${attempt})."
-            exit 0
-        fi
-    fi
-
-    log "Attempt ${attempt} failed."
-done
-
-# 6. Still not back after all attempts
-log "FAILURE: services not up and running after ${MAX_ATTEMPTS} attempts."
-exit 1

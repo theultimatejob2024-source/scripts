@@ -1,21 +1,2 @@
-TG_ARN="<pnc-stub target group ARN>"
-export AWS_DEFAULT_REGION="eu-west-2"
-
-aws elbv2 describe-target-health --target-group-arn "$TG_ARN" \
-  --query 'TargetHealthDescriptions[].[Target.Id,Target.Port,TargetHealth.State]' --output table
-
-aws elbv2 describe-target-groups --target-group-arns "$TG_ARN" \
-  --query 'TargetGroups[0].Protocol' --output text
-
-
-
-PORT=<port>
-for ip in <TASK_IP_1> <TASK_IP_2>; do
-  echo "== $ip =="
-  curl -sS -o "resp_${ip}.txt" \
-    -w 'HTTP %{http_code}, %{size_download} bytes, %{time_total}s\n' \
-    -X POST "http://${ip}:${PORT}/pnc/2020/01" \
-    -H 'Content-Type: text/xml; charset=UTF-8' \
-    --data-binary @request.xml
-  cat "resp_${ip}.txt"; echo
-done
+START_MS=$(date -u -d '30 minutes ago' +%s000); END_MS=$(date -u +%s000)
+for p in "Received HTTP Message" "Received JMS Message" "ERROR" "Exception"; do echo "== $p =="; aws logs filter-log-events --log-group-name "$LOG_GROUP" --start-time "$START_MS" --end-time "$END_MS" --filter-pattern "\"$p\"" --query 'events[].logStreamName' --output text | tr '\t' '\n' | sort | uniq -c; done

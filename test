@@ -1,2 +1,1 @@
-START_MS=$(date -u -d '30 minutes ago' +%s000); END_MS=$(date -u +%s000)
-for p in "Received HTTP Message" "Received JMS Message" "ERROR" "Exception"; do echo "== $p =="; aws logs filter-log-events --log-group-name "$LOG_GROUP" --start-time "$START_MS" --end-time "$END_MS" --filter-pattern "\"$p\"" --query 'events[].logStreamName' --output text | tr '\t' '\n' | sort | uniq -c; done
+aws logs filter-log-events --log-group-name "$LOG_GROUP" --start-time $(date -u -d '1 hour ago' +%s000) --filter-pattern '?ERROR ?Exception ?Fault' --query 'events[].[logStreamName,message]' --output text | head -50

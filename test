@@ -1,1 +1,4 @@
-aws logs filter-log-events --log-group-name "$LOG_GROUP" --start-time $(date -u -d '1 hour ago' +%s000) --filter-pattern '?ERROR ?Exception ?Fault' --query 'events[].[logStreamName,message]' --output text | head -50
+aws logs filter-log-events --log-group-name "$LOG_GROUP" --log-stream-names "ecs/dna-pnc-stub-prp02/52ab84be29df47cebd8affc02e9fd5b8" --start-time $(date -u -d '1 hour ago' +%s000) --filter-pattern '"6afc7fa527c02932b7783804d742e191"' --query 'events[].message' --output text | tr '\t' '\n'
+
+START_MS=$(date -u -d '15 minutes ago' +%s000)
+for s in "Completed 200" "Completed 500"; do echo "== $s =="; aws logs filter-log-events --log-group-name "$LOG_GROUP" --start-time "$START_MS" --filter-pattern "\"$s\"" --query 'events[].logStreamName' --output text | tr '\t' '\n' | sort | uniq -c; done

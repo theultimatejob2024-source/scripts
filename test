@@ -1,24 +1,57 @@
-ALB_ARN="<YOUR_ALB_ARN>"
-ALB_DIM=$(echo "$ALB_ARN" | sed 's#.*:loadbalancer/##')
-START="2026-11-16T18:10:00Z"
-END="2026-11-16T19:10:00Z"
+# Wait until every service has exactly <target> running tasks.
+# Sleeps CHECK_WAIT seconds before each check, up to CHECK_ATTEMPTS checks.
+wait_for_running_count() {
+    local target="$1" label="$2"
+    local check service running all_done
+    for check in $(seq 1 "${CHECK_ATTEMPTS}"); do
+        log "${label}: waiting ${CHECK_WAIT}s before check ${check}/${CHECK_ATTEMPTS}..."
+        sleep "${CHECK_WAIT}"
 
-if [[ -z "$ALB_DIM" || "$ALB_DIM" == "$ALB_ARN" ]]; then
-  echo "ALB_ARN looks wrong - paste the full ARN"
-else
-  echo "Using: $ALB_DIM"
-  for tg in $(aws elbv2 describe-target-groups --load-balancer-arn "$ALB_ARN" \
-                --query 'TargetGroups[].TargetGroupArn' --output text); do
-    tgdim=${tg##*:}
-    line="$tgdim"
-    for metric in RequestCount TargetConnectionErrorCount HTTPCode_Target_5XX_Count; do
-      val=$(aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
-        --metric-name "$metric" \
-        --dimensions Name=LoadBalancer,Value="$ALB_DIM" Name=TargetGroup,Value="$tgdim" \
-        --start-time "$START" --end-time "$END" --period 3600 --statistics Sum \
-        --query 'Datapoints[0].Sum' --output text)
-      line="$line  $metric=$val"
+        all_done=true
+        for service in "${services[@]}"; do
+            running=$(aws ecs describe-services --cluster "${cluster}" --services "${service}" \
+                --query 'services[0].runningCount' --output text)
+            log "${label}: ${service} has ${running} running task(s), want ${target}"
+            if [[ "${running}" != "${target}" ]]; then
+                all_done=false
+            fi
+        done
+
+        if [[ "${all_done}" == "true" ]]; then
+            log "${label}: done."
+            return 0
+        fi
     done
-    echo "$line"
-  done
-fi
+
+    log "ERROR: ${label}: not done after ${CHECK_ATTEMPTS} checks."
+    return 1
+}
+
+
+
+
+restart_services() {
+    local service
+
+    # Stop: scale every service to 0
+    for service in "${services[@]}"; do
+        log "Scaling ${service} down to 0..."
+        aws ecs update-service --cluster "${cluster}" --service "${service}" \
+            --desired-count 0 --query 'service.serviceName' --output text >/dev/null \
+            || { log "ERROR: scale down failed for ${service}"; return 1; }
+    done
+    wait_for_running_count 0 "Stopping" || return 1
+
+    # Stay down for SCALE_DOWN_WAIT
+    log "All tasks stopped. Staying down for ${SCALE_DOWN_WAIT}s..."
+    sleep "${SCALE_DOWN_WAIT}"
+
+    # Start: scale back up
+    for service in "${services[@]}"; do
+        log "Scaling ${service} back up to ${DESIRED_COUNT}..."
+        aws ecs update-service --cluster "${cluster}" --service "${service}" \
+            --desired-count "${DESIRED_COUNT}" --query 'service.serviceName' --output text >/dev/null \
+            || { log "ERROR: scale up failed for ${service}"; return 1; }
+    done
+    wait_for_running_count "${DESIRED_COUNT}" "Starting" || return 1
+}

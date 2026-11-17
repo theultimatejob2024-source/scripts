@@ -1,57 +1,27 @@
-# Wait until every service has exactly <target> running tasks.
-# Sleeps CHECK_WAIT seconds before each check, up to CHECK_ATTEMPTS checks.
-wait_for_running_count() {
-    local target="$1" label="$2"
-    local check service running all_done
-    for check in $(seq 1 "${CHECK_ATTEMPTS}"); do
-        log "${label}: waiting ${CHECK_WAIT}s before check ${check}/${CHECK_ATTEMPTS}..."
-        sleep "${CHECK_WAIT}"
+TG_ARN="<PASTE_TARGET_GROUP_ARN>"
+START="2026-11-17T13:50:00Z"
+END="2026-11-17T14:00:00Z"
+export AWS_DEFAULT_REGION="eu-west-2"
 
-        all_done=true
-        for service in "${services[@]}"; do
-            running=$(aws ecs describe-services --cluster "${cluster}" --services "${service}" \
-                --query 'services[0].runningCount' --output text)
-            log "${label}: ${service} has ${running} running task(s), want ${target}"
-            if [[ "${running}" != "${target}" ]]; then
-                all_done=false
-            fi
-        done
+TG_DIM=${TG_ARN##*:}
+LB_ARN=$(aws elbv2 describe-target-groups --target-group-arns "$TG_ARN" \
+  --query 'TargetGroups[0].LoadBalancerArns[0]' --output text)
+LB_DIM=${LB_ARN#*:loadbalancer/}
+echo "Target group:  $TG_DIM"
+echo "Load balancer: $LB_DIM"
 
-        if [[ "${all_done}" == "true" ]]; then
-            log "${label}: done."
-            return 0
-        fi
-    done
+for metric in RequestCount HTTPCode_Target_2XX_Count HTTPCode_Target_5XX_Count TargetConnectionErrorCount; do
+  echo "== $metric (Sum per minute) =="
+  aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
+    --metric-name "$metric" \
+    --dimensions Name=LoadBalancer,Value="$LB_DIM" Name=TargetGroup,Value="$TG_DIM" \
+    --start-time "$START" --end-time "$END" --period 60 --statistics Sum \
+    --query 'sort_by(Datapoints,&Timestamp)[].[Timestamp,Sum]' --output table
+done
 
-    log "ERROR: ${label}: not done after ${CHECK_ATTEMPTS} checks."
-    return 1
-}
-
-
-
-
-restart_services() {
-    local service
-
-    # Stop: scale every service to 0
-    for service in "${services[@]}"; do
-        log "Scaling ${service} down to 0..."
-        aws ecs update-service --cluster "${cluster}" --service "${service}" \
-            --desired-count 0 --query 'service.serviceName' --output text >/dev/null \
-            || { log "ERROR: scale down failed for ${service}"; return 1; }
-    done
-    wait_for_running_count 0 "Stopping" || return 1
-
-    # Stay down for SCALE_DOWN_WAIT
-    log "All tasks stopped. Staying down for ${SCALE_DOWN_WAIT}s..."
-    sleep "${SCALE_DOWN_WAIT}"
-
-    # Start: scale back up
-    for service in "${services[@]}"; do
-        log "Scaling ${service} back up to ${DESIRED_COUNT}..."
-        aws ecs update-service --cluster "${cluster}" --service "${service}" \
-            --desired-count "${DESIRED_COUNT}" --query 'service.serviceName' --output text >/dev/null \
-            || { log "ERROR: scale up failed for ${service}"; return 1; }
-    done
-    wait_for_running_count "${DESIRED_COUNT}" "Starting" || return 1
-}
+echo "== TargetResponseTime (seconds, max per minute) =="
+aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
+  --metric-name TargetResponseTime \
+  --dimensions Name=LoadBalancer,Value="$LB_DIM" Name=TargetGroup,Value="$TG_DIM" \
+  --start-time "$START" --end-time "$END" --period 60 --statistics Maximum \
+  --query 'sort_by(Datapoints,&Timestamp)[].[Timestamp,Maximum]' --output table

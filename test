@@ -1,27 +1,21 @@
-TG_ARN="<PASTE_TARGET_GROUP_ARN>"
-START="2026-11-17T13:50:00Z"
-END="2026-11-17T14:00:00Z"
+TG_ARN="<pnc-stub target group ARN>"
 export AWS_DEFAULT_REGION="eu-west-2"
 
-TG_DIM=${TG_ARN##*:}
-LB_ARN=$(aws elbv2 describe-target-groups --target-group-arns "$TG_ARN" \
-  --query 'TargetGroups[0].LoadBalancerArns[0]' --output text)
-LB_DIM=${LB_ARN#*:loadbalancer/}
-echo "Target group:  $TG_DIM"
-echo "Load balancer: $LB_DIM"
+aws elbv2 describe-target-health --target-group-arn "$TG_ARN" \
+  --query 'TargetHealthDescriptions[].[Target.Id,Target.Port,TargetHealth.State]' --output table
 
-for metric in RequestCount HTTPCode_Target_2XX_Count HTTPCode_Target_5XX_Count TargetConnectionErrorCount; do
-  echo "== $metric (Sum per minute) =="
-  aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
-    --metric-name "$metric" \
-    --dimensions Name=LoadBalancer,Value="$LB_DIM" Name=TargetGroup,Value="$TG_DIM" \
-    --start-time "$START" --end-time "$END" --period 60 --statistics Sum \
-    --query 'sort_by(Datapoints,&Timestamp)[].[Timestamp,Sum]' --output table
+aws elbv2 describe-target-groups --target-group-arns "$TG_ARN" \
+  --query 'TargetGroups[0].Protocol' --output text
+
+
+
+PORT=<port>
+for ip in <TASK_IP_1> <TASK_IP_2>; do
+  echo "== $ip =="
+  curl -sS -o "resp_${ip}.txt" \
+    -w 'HTTP %{http_code}, %{size_download} bytes, %{time_total}s\n' \
+    -X POST "http://${ip}:${PORT}/pnc/2020/01" \
+    -H 'Content-Type: text/xml; charset=UTF-8' \
+    --data-binary @request.xml
+  cat "resp_${ip}.txt"; echo
 done
-
-echo "== TargetResponseTime (seconds, max per minute) =="
-aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
-  --metric-name TargetResponseTime \
-  --dimensions Name=LoadBalancer,Value="$LB_DIM" Name=TargetGroup,Value="$TG_DIM" \
-  --start-time "$START" --end-time "$END" --period 60 --statistics Maximum \
-  --query 'sort_by(Datapoints,&Timestamp)[].[Timestamp,Maximum]' --output table

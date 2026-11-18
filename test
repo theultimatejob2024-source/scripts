@@ -1,4 +1,31 @@
-aws logs filter-log-events --log-group-name "$LOG_GROUP" --log-stream-names "ecs/dna-pnc-stub-prp02/52ab84be29df47cebd8affc02e9fd5b8" --start-time $(date -u -d '1 hour ago' +%s000) --filter-pattern '"6afc7fa527c02932b7783804d742e191"' --query 'events[].message' --output text | tr '\t' '\n'
+# Set every service to the given desired count
+scale_services() {
+    local count="$1" service
+    for service in "${services[@]}"; do
+        log "Setting ${service} desired count to ${count}..."
+        aws ecs update-service --cluster "${cluster}" --service "${service}" \
+            --desired-count "${count}" --query 'service.serviceName' --output text >/dev/null \
+            || { log "ERROR: could not set ${service} to ${count}"; return 1; }
+    done
+}
 
-START_MS=$(date -u -d '15 minutes ago' +%s000)
-for s in "Completed 200" "Completed 500"; do echo "== $s =="; aws logs filter-log-events --log-group-name "$LOG_GROUP" --start-time "$START_MS" --filter-pattern "\"$s\"" --query 'events[].logStreamName' --output text | tr '\t' '\n' | sort | uniq -c; done
+# Restart: 0 -> wait -> 1 -> wait -> DESIRED_COUNT -> wait
+restart_services() {
+    # 1. Stop all tasks
+    scale_services 0 || return 1
+    wait_for_running_count 0 "Stopping" || return 1
+    log "All tasks stopped. Waiting ${STEP_WAIT}s..."
+    sleep "${STEP_WAIT}"
+
+    # 2. Bring up one task
+    scale_services 1 || return 1
+    wait_for_running_count 1 "Starting first task" || return 1
+    log "First task running. Waiting ${STEP_WAIT}s..."
+    sleep "${STEP_WAIT}"
+
+    # 3. Bring up the rest
+    scale_services "${DESIRED_COUNT}" || return 1
+    wait_for_running_count "${DESIRED_COUNT}" "Starting remaining tasks" || return 1
+    log "All ${DESIRED_COUNT} tasks running. Waiting ${STEP_WAIT}s..."
+    sleep "${STEP_WAIT}"
+}
